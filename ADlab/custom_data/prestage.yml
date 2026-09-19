@@ -1,0 +1,131 @@
+#cloud-config
+
+package_update: true
+
+packages:
+  - realmd
+  - sssd
+  - adcli
+  - oddjob
+  - oddjob-mkhomedir
+  - krb5-workstation
+  - samba-common-tools
+
+write_files:
+  - path: /usr/local/sbin/ad-bootstrap.sh
+    owner: root:root
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      DOMAIN="contoso.com"
+      # The provisioning layer must place the machine-specific
+      # one-time enrollment credential here.
+      SECRET_FILE="/run/ad-enrollment-password"
+
+      log() {
+          logger -t ad-bootstrap "$*"
+          echo "ad-bootstrap: $*"
+      }
+
+      cleanup() {
+          if [ -f "${SECRET_FILE}" ]; then
+              shred -u "${SECRET_FILE}" 2>/dev/null || rm -f "${SECRET_FILE}"
+          fi
+      }
+
+      trap cleanup EXIT
+
+      log "Starting Active Directory bootstrap"
+
+      #
+      # Verify that this machine isn't already joined.
+      #
+      if realm list | grep -qi "^realm-name:.*${DOMAIN}"; then
+          log "Machine is already joined to ${DOMAIN}"
+          exit 0
+      fi
+
+      #
+      # Verify hostname.
+      #
+      HOSTNAME="$(hostname -s)"
+      if [ -z "${HOSTNAME}" ] || [ "${HOSTNAME}" = "localhost" ]; then
+          log "Invalid hostname: ${HOSTNAME}"
+          exit 1
+      fi
+
+      log "Computer name: ${HOSTNAME}"
+
+      #
+      # Verify that AD can be discovered.
+      #
+      log "Discovering ${DOMAIN}"
+      if ! realm discover "${DOMAIN}"; then
+          log "Unable to discover ${DOMAIN}"
+          exit 1
+      fi
+
+      #
+      # Enrollment credential must already have been securely
+      # delivered to the VM.
+      #
+      if [ ! -s "${SECRET_FILE}" ]; then
+          log "Enrollment credential does not exist"
+          exit 1
+      fi
+
+      chmod 600 "${SECRET_FILE}"
+      OTP="$(cat "${SECRET_FILE}")"
+
+      #
+      # Join using the machine-specific enrollment credential.
+      #
+      # Importantly, NO svc-linux-domainjoin credential is used here.
+      #
+
+      log "Joining ${DOMAIN}"
+
+      realm join \
+          --unattended \
+          --one-time-password="${OTP}" \
+          "${DOMAIN}"
+
+      #
+      # Immediately remove enrollment material from memory/file.
+      #
+
+      unset OTP
+      cleanup
+
+      #
+      # Verify domain membership.
+      #
+
+      if ! realm list | grep -qi "^realm-name:.*${DOMAIN}"; then
+          log "Domain membership verification failed"
+          exit 1
+      fi
+
+      #
+      # Verify machine keytab creation.
+      #
+
+      if [ ! -s /etc/krb5.keytab ]; then
+          log "/etc/krb5.keytab was not created"
+          exit 1
+      fi
+
+      log "Machine successfully joined to ${DOMAIN}"
+
+      #
+      # Ensure SSSD is running.
+      #
+
+      systemctl enable --now sssd
+
+      log "Active Directory bootstrap completed successfully"
+
+runcmd:
+  - [ /usr/local/sbin/ad-bootstrap.sh ]
