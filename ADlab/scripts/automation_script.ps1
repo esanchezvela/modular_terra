@@ -4,52 +4,55 @@
 
 <#
 .SYNOPSIS
-    Creates or prepares an Active Directory service account for prestaging
-    Linux computer objects and delegates Create Computer permissions on an OU.
+    Prestages an Active Directory computer account with a cryptographically
+    random initial password and stores the same password in Azure Key Vault.
 
 .DESCRIPTION
-    This script:
+    The script is idempotent and fail-safe.
 
-    1. Checks whether the Active Directory service account already exists.
-    2. If the account does not exist:
-       - Authenticates to Azure using the VM's system-assigned managed identity.
-       - Retrieves the account password from Azure Key Vault.
-       - Treats HTTP 401 and HTTP 403 responses as fatal.
-       - Retries other Key Vault retrieval failures.
-       - Enforces an overall polling timeout.
-       - Creates the Active Directory service account.
-    3. Retrieves the Computer object schema GUID.
-    4. Adds an OU ACL allowing the service account to create Computer objects.
-    5. Avoids adding an equivalent ACL entry more than once.
-    6. Writes operational information to a log without recording secret values.
+    State handling:
 
-    The secret remains a SecureString and is passed directly to New-ADUser.
+      AD computer absent + Key Vault secret absent
+          Creates both resources.
+
+      AD computer present + Key Vault secret present
+          Makes no changes and returns success.
+
+      AD computer present + Key Vault secret absent
+          Stops without changing the AD computer password.
+
+      AD computer absent + Key Vault secret present
+          Stops without overwriting or deleting the Key Vault secret.
+
+    During new provisioning, the script creates the AD computer first and then
+    writes the matching enrollment password to Key Vault. If the Key Vault write
+    fails, it attempts to remove the newly created AD computer object so that a
+    partial provisioning state is not intentionally retained.
+
+    This script never displays or logs the enrollment password.
 
 .EXAMPLE
-    .\Create-LinuxPrestageAccount.ps1 `
-        -ServiceAccountName "svc-linux-domainjoin" `
+    .\New-LinuxComputerEnrollment.ps1 `
+        -ComputerName "LINUXVM01" `
         -ComputerOU "OU=LinuxServers,DC=contoso,DC=com" `
-        -VaultName "kv-linux-domainjoin" `
-        -SecretName "svc-linux-domainjoin-password"
+        -VaultName "kv-linux-domainjoin"
 
 .EXAMPLE
-    .\Create-LinuxPrestageAccount.ps1 `
-        -ServiceAccountName "svc-linux-domainjoin" `
+    .\New-LinuxComputerEnrollment.ps1 `
+        -ComputerName "LINUXVM01" `
         -ComputerOU "OU=LinuxServers,DC=contoso,DC=com" `
         -VaultName "kv-linux-domainjoin" `
-        -SecretName "svc-linux-domainjoin-password" `
+        -SecretPrefix "ad-enrollment-" `
         -SubscriptionId "00000000-0000-0000-0000-000000000000" `
-        -MaxAttempts 10 `
-        -RetryDelaySeconds 30 `
-        -TimeoutSeconds 600 `
-        -Verbose
+        -LogFile "C:\Logs\LINUXVM01-provisioning.log"
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = "High")]
 param (
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string]$ServiceAccountName,
+    [ValidatePattern("^[A-Za-z0-9-]{1,15}$")]
+    [string]$ComputerName,
 
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
@@ -59,43 +62,42 @@ param (
     [ValidateNotNullOrEmpty()]
     [string]$VaultName,
 
-    [Parameter(Mandatory)]
-    [ValidateNotNullOrEmpty()]
-    [string]$SecretName,
+    [Parameter()]
+    [ValidatePattern("^[A-Za-z0-9-]*$")]
+    [string]$SecretPrefix = "",
 
     [Parameter()]
-    [ValidateRange(1, 100)]
-    [int]$MaxAttempts = 10,
-
-    [Parameter()]
-    [ValidateRange(1, 3600)]
-    [int]$RetryDelaySeconds = 30,
-
-    [Parameter()]
-    [ValidateRange(1, 86400)]
-    [int]$TimeoutSeconds = 600,
+    [ValidateRange(32, 128)]
+    [int]$PasswordLength = 64,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$LogFile = "C:\Logs\Linux-AD-Prestage.log",
+    [string]$SubscriptionId,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$SubscriptionId
+    [string]$LogFile = "C:\Logs\Linux-Computer-Provisioning.log"
 )
 
 Set-StrictMode -Version 2.0
-
 $ErrorActionPreference = "Stop"
 
-$Secret = $null
-$AccountPassword = $null
 $AzureConnected = $false
-$Stopwatch = $null
+$ComputerCreatedByThisRun = $false
+$EnrollmentPasswordPlainText = $null
+$EnrollmentPassword = $null
+$KeyVaultSecret = $null
+
+#
+# Normalize identifiers.
+#
+$NormalizedComputerName = $ComputerName.ToUpperInvariant()
+$ComputerSamAccountName = "$NormalizedComputerName`$"
+$SecretName = "$SecretPrefix$NormalizedComputerName"
 
 #
 # ---------------------------------------------------------------------------
-# Logging function
+# Logging
 # ---------------------------------------------------------------------------
 #
 
@@ -112,12 +114,12 @@ function Write-Log {
     )
 
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "{0} [{1}] {2}" -f $Timestamp, $Level, $Message
+    $Entry = "{0} [{1}] {2}" -f $Timestamp, $Level, $Message
 
     try {
         Add-Content `
             -LiteralPath $script:LogFile `
-            -Value $LogEntry `
+            -Value $Entry `
             -Encoding UTF8 `
             -ErrorAction Stop
     }
@@ -131,22 +133,22 @@ function Write-Log {
 
     switch ($Level) {
         "INFO" {
-            Write-Host $LogEntry
+            Write-Host $Entry
         }
 
         "WARNING" {
-            Write-Host $LogEntry -ForegroundColor Yellow
+            Write-Host $Entry -ForegroundColor Yellow
         }
 
         "ERROR" {
-            Write-Host $LogEntry -ForegroundColor Red
+            Write-Host $Entry -ForegroundColor Red
         }
     }
 }
 
 #
 # ---------------------------------------------------------------------------
-# Convert an HTTP status value to an integer
+# HTTP error inspection
 # ---------------------------------------------------------------------------
 #
 
@@ -161,27 +163,21 @@ function ConvertTo-HttpStatusCode {
         return [int]$Value
     }
     catch {
-        try {
-            if (
-                $null -ne $Value -and
-                $Value.PSObject.Properties.Name -contains "value__"
-            ) {
+        if (
+            $null -ne $Value -and
+            $Value.PSObject.Properties.Name -contains "value__"
+        ) {
+            try {
                 return [int]$Value.value__
             }
-        }
-        catch {
-            return $null
+            catch {
+                return $null
+            }
         }
     }
 
     return $null
 }
-
-#
-# ---------------------------------------------------------------------------
-# Extract HTTP status code from an exception
-# ---------------------------------------------------------------------------
-#
 
 function Get-ExceptionHttpStatusCode {
     [CmdletBinding()]
@@ -193,50 +189,34 @@ function Get-ExceptionHttpStatusCode {
     $CurrentException = $Exception
 
     while ($null -ne $CurrentException) {
-        #
-        # Some Az exceptions expose StatusCode directly.
-        #
         if (
             $CurrentException.PSObject.Properties.Name -contains "StatusCode" -and
             $null -ne $CurrentException.StatusCode
         ) {
-            $StatusCode = ConvertTo-HttpStatusCode `
+            $Code = ConvertTo-HttpStatusCode `
                 -Value $CurrentException.StatusCode
 
-            if ($null -ne $StatusCode) {
-                return $StatusCode
+            if ($null -ne $Code) {
+                return $Code
             }
         }
 
-        #
-        # Other exceptions expose Response.StatusCode.
-        #
         if (
             $CurrentException.PSObject.Properties.Name -contains "Response" -and
-            $null -ne $CurrentException.Response
+            $null -ne $CurrentException.Response -and
+            $CurrentException.Response.PSObject.Properties.Name -contains "StatusCode"
         ) {
-            $Response = $CurrentException.Response
+            $Code = ConvertTo-HttpStatusCode `
+                -Value $CurrentException.Response.StatusCode
 
-            if (
-                $Response.PSObject.Properties.Name -contains "StatusCode" -and
-                $null -ne $Response.StatusCode
-            ) {
-                $StatusCode = ConvertTo-HttpStatusCode `
-                    -Value $Response.StatusCode
-
-                if ($null -ne $StatusCode) {
-                    return $StatusCode
-                }
+            if ($null -ne $Code) {
+                return $Code
             }
         }
 
         $CurrentException = $CurrentException.InnerException
     }
 
-    #
-    # Compatibility fallback for module versions that only include
-    # the HTTP status in the exception text.
-    #
     $ExceptionText = $Exception.ToString()
 
     if (
@@ -254,45 +234,148 @@ function Get-ExceptionHttpStatusCode {
         return 403
     }
 
+    if (
+        $ExceptionText -match "(?i)\b404\b" -or
+        $ExceptionText -match "(?i)\bSecretNotFound\b" -or
+        $ExceptionText -match "(?i)\bnot found\b"
+    ) {
+        return 404
+    }
+
     return $null
 }
 
 #
 # ---------------------------------------------------------------------------
-# Create the log directory
+# Cryptographically secure random-number helper
+# ---------------------------------------------------------------------------
+#
+
+function Get-CryptoRandomInt {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 2147483647)]
+        [int]$MaximumExclusive
+    )
+
+    $Bytes = New-Object byte[] 4
+
+    $Limit = :MaxValue -
+        (:MaxValue % [uint64]$MaximumExclusive)
+
+    do {
+        $script:RandomNumberGenerator.GetBytes($Bytes)
+
+        $Value = :ToUInt32($Bytes, 0)
+    }
+    while ([uint64]$Value -ge $Limit)
+
+    return [uint64]$Value % [uint64]$MaximumExclusive
+}
+
+#
+# ---------------------------------------------------------------------------
+# Generate an AD-compatible random enrollment password
+# ---------------------------------------------------------------------------
+#
+
+function New-EnrollmentPassword {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateRange(32, 128)]
+        [int]$Length
+    )
+
+    $Uppercase = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    $Lowercase = "abcdefghijkmnopqrstuvwxyz"
+    $Numbers   = "23456789"
+    $Special   = "!#%+,-.:=@_"
+    $All       = $Uppercase + $Lowercase + $Numbers + $Special
+
+    $Characters = New-Object System.Collections.Generic.List[char]
+
+    #
+    # Guarantee inclusion of each character class.
+    #
+    $Characters.Add(
+        $Uppercase[
+            (Get-CryptoRandomInt -MaximumExclusive $Uppercase.Length)
+        ]
+    )
+
+    $Characters.Add(
+        $Lowercase[
+            (Get-CryptoRandomInt -MaximumExclusive $Lowercase.Length)
+        ]
+    )
+
+    $Characters.Add(
+        $Numbers[
+            (Get-CryptoRandomInt -MaximumExclusive $Numbers.Length)
+        ]
+    )
+
+    $Characters.Add(
+        $Special[
+            (Get-CryptoRandomInt -MaximumExclusive $Special.Length)
+        ]
+    )
+
+    while ($Characters.Count -lt $Length) {
+        $Characters.Add(
+            $All[
+                (Get-CryptoRandomInt -MaximumExclusive $All.Length)
+            ]
+        )
+    }
+
+    #
+    # Cryptographically shuffle the complete character set.
+    #
+    for ($Index = $Characters.Count - 1; $Index -gt 0; $Index--) {
+        $SwapIndex = Get-CryptoRandomInt `
+            -MaximumExclusive ($Index + 1)
+
+        $TemporaryCharacter = $Characters[$Index]
+        $Characters[$Index] = $Characters[$SwapIndex]
+        $Characters[$SwapIndex] = $TemporaryCharacter
+    }
+
+    return -join $Characters
+}
+
+#
+# ---------------------------------------------------------------------------
+# Prepare logging
 # ---------------------------------------------------------------------------
 #
 
 $LogDirectory = Split-Path -Path $LogFile -Parent
 
 if (
-    -not [string]::Is -and
+    -not :IsNullOrWhiteSpace($LogDirectory) -and
     -not (Test-Path -LiteralPath $LogDirectory)
 ) {
-    try {
-        New-Item `
-            -ItemType Directory `
-            -Path $LogDirectory `
-            -Force `
-            -ErrorAction Stop | Out-Null
-    }
-    catch {
-        throw (
-            "Unable to create log directory '{0}': {1}" -f
-            $LogDirectory,
-            $_.Exception.Message
-        )
-    }
+    New-Item `
+        -ItemType Directory `
+        -Path $LogDirectory `
+        -Force `
+        -ErrorAction Stop | Out-Null
 }
 
-Write-Log "Starting Linux Active Directory prestaging configuration."
-Write-Log "Service account: $ServiceAccountName"
+Write-Log "Starting Linux computer-account enrollment provisioning."
+Write-Log "Computer name: $NormalizedComputerName"
+Write-Log "Computer sAMAccountName: $ComputerSamAccountName"
 Write-Log "Target OU: $ComputerOU"
+Write-Log "Key Vault: $VaultName"
+Write-Log "Key Vault secret name: $SecretName"
 
 try {
     #
     # -----------------------------------------------------------------------
-    # Import required modules
+    # Load modules
     # -----------------------------------------------------------------------
     #
 
@@ -302,601 +385,447 @@ try {
     Import-Module Az.Accounts -ErrorAction Stop
     Import-Module Az.KeyVault -ErrorAction Stop
 
-    Write-Log "Required PowerShell modules imported successfully."
-
     #
     # -----------------------------------------------------------------------
-    # Determine Active Directory domain information
+    # Validate the target OU
     # -----------------------------------------------------------------------
     #
 
-    Write-Log "Retrieving Active Directory domain information."
+    Write-Log "Validating target organizational unit."
 
-    $Domain = Get-ADDomain -ErrorAction Stop
+    $TargetOU = Get-ADOrganizationalUnit `
+        -Identity $ComputerOU `
+        -ErrorAction Stop
 
-    $DomainDN = $Domain.DistinguishedName
-    $DnsRoot = $Domain.DNSRoot
-
-    if ([string]::Is {
-        throw "Get-ADDomain did not return a distinguished name."
+    if ($null -eq $TargetOU) {
+        throw "The target OU could not be found: $ComputerOU"
     }
 
-    if ([string]::Is {
-        throw "Get-ADDomain did not return a DNS root."
+    Write-Log "Target organizational unit validated."
+
+    #
+    # -----------------------------------------------------------------------
+    # Authenticate using the provisioning VM's managed identity
+    # -----------------------------------------------------------------------
+    #
+
+    Write-Log "Authenticating to Azure using the VM managed identity."
+
+    Disable-AzContextAutosave `
+        -Scope Process `
+        -ErrorAction Stop | Out-Null
+
+    Connect-AzAccount `
+        -Identity `
+        -ErrorAction Stop | Out-Null
+
+    $AzureConnected = $true
+
+    if (-not :IsNullOrWhiteSpace($SubscriptionId)) {
+        Set-AzContext `
+            -SubscriptionId $SubscriptionId `
+            -ErrorAction Stop | Out-Null
     }
 
-    Write-Log "Active Directory domain detected: $DnsRoot"
+    Write-Log "Managed-identity authentication completed."
 
     #
     # -----------------------------------------------------------------------
-    # Validate target OU
+    # Preflight: check the AD computer object
     # -----------------------------------------------------------------------
     #
 
-    Write-Log "Validating target OU."
+    Write-Log "Checking Active Directory for the computer account."
 
-    try {
-        $OU = Get-ADOrganizationalUnit `
-            -Identity $ComputerOU `
-            -ErrorAction Stop
-    }
-    catch {
-        throw (
-            "The specified OU does not exist or cannot be accessed: {0}. {1}" -f
-            $ComputerOU,
-            $_.Exception.Message
-        )
-    }
+    $EscapedSamAccountName =
+        $ComputerSamAccountName.Replace("'", "''")
 
-    Write-Log "Target OU validated successfully."
-
-    #
-    # -----------------------------------------------------------------------
-    # Check whether the service account already exists
-    # -----------------------------------------------------------------------
-    #
-
-    Write-Log "Checking whether service account '$ServiceAccountName' exists."
-
-    $EscapedServiceAccountName = $ServiceAccountName.Replace("'", "''")
-
-    $ServiceAccounts = @(
-        Get-ADUser `
-            -Filter "SamAccountName -eq '$EscapedServiceAccountName'" `
+    $ExistingComputers = @(
+        Get-ADComputer `
+            -Filter "SamAccountName -eq '$EscapedSamAccountName'" `
+            -Properties DistinguishedName, Enabled `
             -ErrorAction Stop
     )
 
-    if ($ServiceAccounts.Count -gt 1) {
+    if ($ExistingComputers.Count -gt 1) {
         throw (
-            "Multiple Active Directory users were returned for " +
-            "sAMAccountName '$ServiceAccountName'."
+            "Multiple Active Directory computer objects were returned for " +
+            "sAMAccountName '$ComputerSamAccountName'."
         )
     }
 
-    $ServiceAccount = $ServiceAccounts | Select-Object -First 1
+    $ExistingComputer =
+        $ExistingComputers |
+        Select-Object -First 1
 
-    if ($null -ne $ServiceAccount) {
-        Write-Log `
-            "Service account already exists. Key Vault retrieval is not required." `
-            -Level "WARNING"
+    #
+    # -----------------------------------------------------------------------
+    # Preflight: check the Key Vault secret
+    # -----------------------------------------------------------------------
+    #
+
+    Write-Log "Checking Azure Key Vault for the enrollment secret."
+
+    $ExistingSecret = $null
+
+    try {
+        $ExistingSecret = Get-AzKeyVaultSecret `
+            -VaultName $VaultName `
+            -Name $SecretName `
+            -ErrorAction Stop
     }
-    else {
+    catch {
+        $StatusCode = Get-ExceptionHttpStatusCode `
+            -Exception $_.Exception
+
+        switch ($StatusCode) {
+            401 {
+                throw (
+                    "Azure Key Vault returned HTTP 401 Unauthorized while " +
+                    "checking secret '$SecretName'."
+                )
+            }
+
+            403 {
+                throw (
+                    "Azure Key Vault returned HTTP 403 Forbidden while " +
+                    "checking secret '$SecretName'. Verify managed-identity " +
+                    "permissions and Key Vault network controls."
+                )
+            }
+
+            404 {
+                #
+                # Expected state for a computer that has not been provisioned.
+                #
+                $ExistingSecret = $null
+            }
+
+            default {
+                throw (
+                    "Unable to determine whether Key Vault secret " +
+                    "'$SecretName' exists: $($_.Exception.Message)"
+                )
+            }
+        }
+    }
+
+    #
+    # -----------------------------------------------------------------------
+    # Evaluate existing state
+    # -----------------------------------------------------------------------
+    #
+
+    $ComputerExists = $null -ne $ExistingComputer
+    $SecretExists = $null -ne $ExistingSecret
+
+    if ($ComputerExists -and $SecretExists) {
         Write-Log (
-            "Service account does not exist. Retrieving its password " +
-            "from Azure Key Vault."
-        )
+            "The AD computer account and Key Vault secret both already " +
+            "exist. No changes are required."
+        ) -Level "WARNING"
 
-        #
-        # -------------------------------------------------------------------
-        # Authenticate using the VM system-assigned managed identity
-        # -------------------------------------------------------------------
-        #
+        Write-Host ""
+        Write-Host "Provisioning state: Already provisioned"
+        Write-Host "Computer:           $NormalizedComputerName"
+        Write-Host "AD object:          $($ExistingComputer.DistinguishedName)"
+        Write-Host "Key Vault:          $VaultName"
+        Write-Host "Secret:             $SecretName"
+        Write-Host "Action:             No changes"
+        Write-Host ""
 
-        try {
-            Write-Log (
-                "Authenticating to Azure using the VM system-assigned " +
-                "managed identity."
-            )
-
-            Disable-AzContextAutosave `
-                -Scope Process `
-                -ErrorAction Stop | Out-Null
-
-            Connect-AzAccount `
-                -Identity `
-                -ErrorAction Stop | Out-Null
-
-            $AzureConnected = $true
-
-            if (-not [string]::Is {
-                Write-Log "Selecting Azure subscription '$SubscriptionId'."
-
-                Set-AzContext `
-                    -SubscriptionId $SubscriptionId `
-                    -ErrorAction Stop | Out-Null
-            }
-
-            Write-Log "Managed identity authentication completed successfully."
-        }
-        catch {
-            $AuthenticationStatusCode = Get-ExceptionHttpStatusCode `
-                -Exception $_.Exception
-
-            switch ($AuthenticationStatusCode) {
-                401 {
-                    Write-Log `
-                        "Fatal Azure authentication error: HTTP 401 Unauthorized." `
-                        -Level "ERROR"
-
-                    throw (
-                        "Managed identity authentication failed with " +
-                        "HTTP 401 Unauthorized."
-                    )
-                }
-
-                403 {
-                    Write-Log `
-                        "Fatal Azure authorization error: HTTP 403 Forbidden." `
-                        -Level "ERROR"
-
-                    throw (
-                        "Managed identity authentication failed with " +
-                        "HTTP 403 Forbidden."
-                    )
-                }
-
-                default {
-                    Write-Log `
-                        "Managed identity authentication failed: $($_.Exception.Message)" `
-                        -Level "ERROR"
-
-                    throw
-                }
-            }
-        }
-
-        #
-        # -------------------------------------------------------------------
-        # Retrieve Key Vault secret
-        # -------------------------------------------------------------------
-        #
-
-        $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        $FatalKeyVaultError = $false
-        $LastRetrievalError = $null
-        $AttemptsPerformed = 0
-
-        for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
-            if ($Stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
-                Write-Log (
-                    "Overall Key Vault polling timeout of $TimeoutSeconds " +
-                    "seconds was reached before attempt $Attempt."
-                ) -Level "ERROR"
-
-                break
-            }
-
-            $AttemptsPerformed = $Attempt
-
-            try {
-                $ElapsedSeconds = :Round(
-                    $Stopwatch.Elapsed.TotalSeconds,
-                    2
-                )
-
-                Write-Log (
-                    "Attempt $Attempt of $MaxAttempts retrieving secret " +
-                    "'$SecretName' from vault '$VaultName'. " +
-                    "Elapsed time: $ElapsedSeconds seconds."
-                )
-
-                $Secret = Get-AzKeyVaultSecret `
-                    -VaultName $VaultName `
-                    -Name $SecretName `
-                    -ErrorAction Stop
-
-                if (
-                    $null -ne $Secret -and
-                    $null -ne $Secret.SecretValue
-                ) {
-                    Write-Log (
-                        "Secret '$SecretName' retrieved successfully " +
-                        "on attempt $Attempt."
-                    )
-
-                    break
-                }
-
-                $Secret = $null
-                $LastRetrievalError = (
-                    "Key Vault returned no secret value for '$SecretName'."
-                )
-
-                Write-Log $LastRetrievalError -Level "WARNING"
-            }
-            catch {
-                $LastRetrievalError = $_.Exception.Message
-
-                $StatusCode = Get-ExceptionHttpStatusCode `
-                    -Exception $_.Exception
-
-                switch ($StatusCode) {
-                    401 {
-                        Write-Log (
-                            "Fatal Key Vault error: HTTP 401 Unauthorized. " +
-                            "The request was not authenticated."
-                        ) -Level "ERROR"
-
-                        $FatalKeyVaultError = $true
-                    }
-
-                    403 {
-                        Write-Log (
-                            "Fatal Key Vault error: HTTP 403 Forbidden. " +
-                            "The managed identity is not authorized, or " +
-                            "Key Vault network controls denied the request."
-                        ) -Level "ERROR"
-
-                        $FatalKeyVaultError = $true
-                    }
-
-                    default {
-                        Write-Log (
-                            "Attempt $Attempt failed: " +
-                            $LastRetrievalError
-                        ) -Level "WARNING"
-                    }
-                }
-
-                if ($FatalKeyVaultError) {
-                    break
-                }
-            }
-
-            #
-            # Do not sleep after the final attempt.
-            #
-            if ($Attempt -ge $MaxAttempts) {
-                break
-            }
-
-            $RemainingSeconds = :Floor(
-                $TimeoutSeconds - $Stopwatch.Elapsed.TotalSeconds
-            )
-
-            if ($RemainingSeconds -le 0) {
-                Write-Log (
-                    "Overall Key Vault polling timeout of $TimeoutSeconds " +
-                    "seconds was reached."
-                ) -Level "ERROR"
-
-                break
-            }
-
-            $SleepSeconds = :Min(
-                $RetryDelaySeconds,
-                [int]$RemainingSeconds
-            )
-
-            if ($SleepSeconds -gt 0) {
-                Write-Log (
-                    "Waiting $SleepSeconds seconds before the next " +
-                    "Key Vault retrieval attempt."
-                )
-
-                Start-Sleep -Seconds $SleepSeconds
-            }
-        }
-
-        if ($null -ne $Stopwatch) {
-            $Stopwatch.Stop()
-        }
-
-        #
-        # -------------------------------------------------------------------
-        # Validate retrieval result
-        # -------------------------------------------------------------------
-        #
-
-        if ($FatalKeyVaultError) {
-            throw (
-                "Key Vault retrieval stopped because Azure returned " +
-                "HTTP 401 or HTTP 403. Review managed identity authentication, " +
-                "Key Vault permissions, and Key Vault network controls."
-            )
-        }
-
-        if (
-            $null -eq $Secret -or
-            $null -eq $Secret.SecretValue
-        ) {
-            $TotalElapsedSeconds = :Round(
-                $Stopwatch.Elapsed.TotalSeconds,
-                2
-            )
-
-            $FailureMessage = (
-                "Unable to retrieve secret '$SecretName' from vault " +
-                "'$VaultName' after $AttemptsPerformed attempt(s) and " +
-                "$TotalElapsedSeconds seconds."
-            )
-
-            if (-not [string]::Is {
-                $FailureMessage += " Last error: $LastRetrievalError"
-            }
-
-            Write-Log $FailureMessage -Level "ERROR"
-
-            throw (
-                "Unable to retrieve Key Vault secret '$SecretName'. " +
-                "Review log file '$LogFile'."
-            )
-        }
-
-        #
-        # Preserve the secret as a SecureString.
-        #
-        $AccountPassword = $Secret.SecretValue
-
-        #
-        # -------------------------------------------------------------------
-        # Create service account
-        # -------------------------------------------------------------------
-        #
-
-        Write-Log "Creating Active Directory service account '$ServiceAccountName'."
-
-        try {
-            $ServiceAccount = New-ADUser `
-                -Name $ServiceAccountName `
-                -SamAccountName $ServiceAccountName `
-                -UserPrincipalName "$ServiceAccountName@$DnsRoot" `
-                -AccountPassword $AccountPassword `
-                -Enabled $true `
-                -PasswordNeverExpires $false `
-                -CannotChangePassword $false `
-                -PassThru `
-                -ErrorAction Stop
-        }
-        catch {
-            throw (
-                "Failed to create service account '{0}': {1}" -f
-                $ServiceAccountName,
-                $_.Exception.Message
-            )
-        }
-
-        Write-Log "Service account created successfully."
-
-        #
-        # Release references to the Key Vault secret as soon as account
-        # creation is complete.
-        #
-        $AccountPassword = $null
-        $Secret = $null
+        return
     }
 
-    #
-    # -----------------------------------------------------------------------
-    # Retrieve service-account SID
-    # -----------------------------------------------------------------------
-    #
-
-    Write-Log "Retrieving the service account SID."
-
-    try {
-        $ServiceAccount = Get-ADUser `
-            -Identity $ServiceAccountName `
-            -Properties SID `
-            -ErrorAction Stop
-    }
-    catch {
+    if ($ComputerExists -and -not $SecretExists) {
         throw (
-            "Unable to retrieve service account '{0}': {1}" -f
-            $ServiceAccountName,
-            $_.Exception.Message
+            "Fail-safe stop: AD computer '$ComputerSamAccountName' exists, " +
+            "but Key Vault secret '$SecretName' does not exist. The script " +
+            "will not reset the computer password automatically because that " +
+            "could invalidate an existing machine credential."
         )
     }
 
-    if ($null -eq $ServiceAccount.SID) {
-        throw "No SID was returned for service account '$ServiceAccountName'."
-    }
-
-    $SID = [System.Security.Principal.SecurityIdentifier]$ServiceAccount.SID
-
-    Write-Log "Service account SID retrieved successfully: $($SID.Value)"
-
-    #
-    # -----------------------------------------------------------------------
-    # Retrieve Computer object schema GUID
-    # -----------------------------------------------------------------------
-    #
-
-    Write-Log "Retrieving the Active Directory Computer object schema GUID."
-
-    try {
-        $RootDSE = Get-ADRootDSE -ErrorAction Stop
-
-        $ComputerSchema = Get-ADObject `
-            -SearchBase $RootDSE.SchemaNamingContext `
-            -LDAPFilter "(lDAPDisplayName=computer)" `
-            -Properties schemaIDGUID `
-            -ErrorAction Stop
-    }
-    catch {
+    if (-not $ComputerExists -and $SecretExists) {
         throw (
-            "Unable to retrieve the Computer object schema GUID: {0}" -f
-            $_.Exception.Message
+            "Fail-safe stop: Key Vault secret '$SecretName' exists, but AD " +
+            "computer '$ComputerSamAccountName' does not exist. The script " +
+            "will not overwrite or reuse the existing secret automatically."
         )
     }
+
+    #
+    # -----------------------------------------------------------------------
+    # Both resources are absent: begin new provisioning transaction
+    # -----------------------------------------------------------------------
+    #
 
     if (
-        $null -eq $ComputerSchema -or
-        $null -eq $ComputerSchema.schemaIDGUID
+        -not $PSCmdlet.ShouldProcess(
+            "$NormalizedComputerName and Key Vault secret $SecretName",
+            "Create AD computer account and enrollment secret"
+        )
     ) {
-        throw "The Computer object schema definition could not be located."
+        Write-Log "Provisioning was not approved or was executed with WhatIf." `
+            -Level "WARNING"
+
+        return
     }
 
-    $ComputerObjectGuid = New-Object `
-        -TypeName System.Guid `
-        -ArgumentList (,$ComputerSchema.schemaIDGUID)
+    Write-Log "Generating a cryptographically random enrollment password."
 
-    Write-Log "Computer object schema GUID retrieved: $ComputerObjectGuid"
-
-    #
-    # -----------------------------------------------------------------------
-    # Read target OU ACL
-    # -----------------------------------------------------------------------
-    #
-
-    $OUPath = "AD:\$ComputerOU"
-
-    Write-Log "Reading the ACL for '$ComputerOU'."
+    $RandomNumberGenerator =
+        [System.Security.Cryptography.RandomNumberGenerator]::Create()
 
     try {
-        $ACL = Get-Acl `
-            -Path $OUPath `
+        $EnrollmentPasswordPlainText =
+            New-EnrollmentPassword -Length $PasswordLength
+    }
+    finally {
+        $RandomNumberGenerator.Dispose()
+        $RandomNumberGenerator = $null
+    }
+
+    $EnrollmentPassword = ConvertTo-SecureString `
+        -String $EnrollmentPasswordPlainText `
+        -AsPlainText `
+        -Force
+
+    #
+    # -----------------------------------------------------------------------
+    # Create the AD computer object
+    # -----------------------------------------------------------------------
+    #
+
+    Write-Log "Creating Active Directory computer '$ComputerSamAccountName'."
+
+    $CreatedComputer = New-ADComputer `
+        -Name $NormalizedComputerName `
+        -SamAccountName $ComputerSamAccountName `
+        -AccountPassword $EnrollmentPassword `
+        -Path $ComputerOU `
+        -Enabled $true `
+        -Description "Prestaged Linux computer enrollment account" `
+        -PassThru `
+        -ErrorAction Stop
+
+    $ComputerCreatedByThisRun = $true
+
+    Write-Log (
+        "Active Directory computer created: " +
+        $CreatedComputer.DistinguishedName
+    )
+
+    #
+    # -----------------------------------------------------------------------
+    # Verify the AD object before writing the secret
+    # -----------------------------------------------------------------------
+    #
+
+    $VerifiedComputer = Get-ADComputer `
+        -Identity $CreatedComputer.DistinguishedName `
+        -Properties Enabled, SamAccountName `
+        -ErrorAction Stop
+
+    if ($null -eq $VerifiedComputer) {
+        throw "The new AD computer object could not be verified."
+    }
+
+    if ($VerifiedComputer.SamAccountName -ne $ComputerSamAccountName) {
+        throw (
+            "The new AD computer object has an unexpected sAMAccountName. " +
+            "Expected '$ComputerSamAccountName'; received " +
+            "'$($VerifiedComputer.SamAccountName)'."
+        )
+    }
+
+    if (-not $VerifiedComputer.Enabled) {
+        throw "The new AD computer object is not enabled."
+    }
+
+    Write-Log "Active Directory computer creation verified."
+
+    #
+    # -----------------------------------------------------------------------
+    # Recheck Key Vault immediately before writing
+    #
+    # This reduces the chance of overwriting a secret created concurrently
+    # after the initial preflight check.
+    # -----------------------------------------------------------------------
+    #
+
+    Write-Log "Performing final Key Vault conflict check."
+
+    $ConcurrentSecret = $null
+
+    try {
+        $ConcurrentSecret = Get-AzKeyVaultSecret `
+            -VaultName $VaultName `
+            -Name $SecretName `
             -ErrorAction Stop
     }
     catch {
+        $StatusCode = Get-ExceptionHttpStatusCode `
+            -Exception $_.Exception
+
+        if ($StatusCode -ne 404) {
+            throw
+        }
+    }
+
+    if ($null -ne $ConcurrentSecret) {
         throw (
-            "Unable to read the ACL for '{0}': {1}" -f
-            $ComputerOU,
-            $_.Exception.Message
+            "A Key Vault secret named '$SecretName' appeared after the " +
+            "preflight check. The script will not overwrite it."
         )
     }
 
-    $Identity = New-Object `
-        -TypeName System.Security.Principal.SecurityIdentifier `
-        -ArgumentList $SID.Value
-
     #
     # -----------------------------------------------------------------------
-    # Build the Create Computer Objects ACE
+    # Store the exact same password in Azure Key Vault
     # -----------------------------------------------------------------------
     #
 
-    $CreateComputerRule = New-Object `
-        -TypeName System.DirectoryServices.ActiveDirectoryAccessRule `
-        -ArgumentList @(
-            $Identity,
-            [System.DirectoryServices.ActiveDirectoryRights]::CreateChild,
-            [System.Security.AccessControl.AccessControlType]::Allow,
-            $ComputerObjectGuid,
-            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
-        )
+    Write-Log "Writing the enrollment secret to Azure Key Vault."
 
-    #
-    # -----------------------------------------------------------------------
-    # Detect an equivalent existing ACE
-    # -----------------------------------------------------------------------
-    #
-
-    Write-Log "Checking for an existing Create Computer Objects delegation."
-
-    $ExistingRule = $ACL.Access | Where-Object {
-        $ExistingSID = $null
-
-        try {
-            $ExistingSID = $_.IdentityReference.Translate(
-                [System.Security.Principal.SecurityIdentifier]
-            )
-        }
-        catch {
-            Write-Verbose (
-                "Unable to translate ACL identity '{0}' to a SID." -f
-                $_.IdentityReference
-            )
-        }
-
-        $HasCreateChild = (
-            (
-                $_.ActiveDirectoryRights -band
-                [System.DirectoryServices.ActiveDirectoryRights]::CreateChild
-            ) -eq
-            [System.DirectoryServices.ActiveDirectoryRights]::CreateChild
-        )
-
-        $SIDMatches = (
-            $null -ne $ExistingSID -and
-            $ExistingSID.Value -eq $SID.Value
-        )
-
-        $SIDMatches -and
-        $HasCreateChild -and
-        $_.AccessControlType -eq `
-            [System.Security.AccessControl.AccessControlType]::Allow -and
-        $_.ObjectType -eq $ComputerObjectGuid
-    } | Select-Object -First 1
-
-    if ($null -ne $ExistingRule) {
-        Write-Log (
-            "Create Computer Objects delegation already exists. " +
-            "ACL update skipped."
-        ) -Level "WARNING"
+    $SecretTags = @{
+        "ComputerName"      = $NormalizedComputerName
+        "SamAccountName"    = $ComputerSamAccountName
+        "ComputerObjectDN"  = $CreatedComputer.DistinguishedName
+        "Purpose"           = "Linux-AD-Enrollment"
+        "ProvisioningState" = "Pending-Consumption"
     }
-    else {
-        Write-Log "Adding Create Computer Objects delegation."
 
-        $ACL.AddAccessRule($CreateComputerRule)
+    $KeyVaultSecret = Set-AzKeyVaultSecret `
+        -VaultName $VaultName `
+        -Name $SecretName `
+        -SecretValue $EnrollmentPassword `
+        -ContentType "Linux Active Directory enrollment password" `
+        -Tag $SecretTags `
+        -ErrorAction Stop
 
-        try {
-            Set-Acl `
-                -Path $OUPath `
-                -AclObject $ACL `
-                -ErrorAction Stop
-        }
-        catch {
-            throw (
-                "Unable to update the ACL for '{0}': {1}" -f
-                $ComputerOU,
-                $_.Exception.Message
-            )
-        }
+    if (
+        $null -eq $KeyVaultSecret -or
+        :IsNullOrWhiteSpace($KeyVaultSecret.Id)
+    ) {
+        throw (
+            "Set-AzKeyVaultSecret returned without a verifiable secret ID."
+        )
+    }
 
-        Write-Log "OU delegation added successfully."
+    Write-Log (
+        "Key Vault enrollment secret created successfully. " +
+        "Secret version: $($KeyVaultSecret.Version)"
+    )
+
+    #
+    # -----------------------------------------------------------------------
+    # Final paired-state verification
+    # -----------------------------------------------------------------------
+    #
+
+    Write-Log "Verifying the final paired provisioning state."
+
+    $FinalComputer = Get-ADComputer `
+        -Identity $CreatedComputer.DistinguishedName `
+        -Properties Enabled, SamAccountName `
+        -ErrorAction Stop
+
+    $FinalSecret = Get-AzKeyVaultSecret `
+        -VaultName $VaultName `
+        -Name $SecretName `
+        -ErrorAction Stop
+
+    if ($null -eq $FinalComputer) {
+        throw "Final verification could not retrieve the AD computer object."
+    }
+
+    if ($null -eq $FinalSecret) {
+        throw "Final verification could not retrieve the Key Vault secret."
     }
 
     #
-    # -----------------------------------------------------------------------
-    # Completion summary
-    # -----------------------------------------------------------------------
+    # Provisioning is now committed. Do not roll back the AD object.
     #
+    $ComputerCreatedByThisRun = $false
 
-    Write-Log "Linux Active Directory prestaging configuration completed successfully."
+    Write-Log "Paired provisioning completed successfully."
 
     Write-Host ""
     Write-Host "============================================================"
-    Write-Host "Linux AD Prestaging Configuration"
+    Write-Host "Linux Computer Enrollment Provisioning"
     Write-Host "============================================================"
     Write-Host ""
-    Write-Host "Account: $ServiceAccountName"
-    Write-Host "UPN:     $ServiceAccountName@$DnsRoot"
-    Write-Host "SID:     $($SID.Value)"
-    Write-Host "OU:      $ComputerOU"
-    Write-Host "Rights:  Create Computer Objects"
-    Write-Host "Log:     $LogFile"
+    Write-Host "Computer:       $NormalizedComputerName"
+    Write-Host "sAMAccountName: $ComputerSamAccountName"
+    Write-Host "AD object:      $($FinalComputer.DistinguishedName)"
+    Write-Host "Key Vault:      $VaultName"
+    Write-Host "Secret name:    $SecretName"
+    Write-Host "Secret version: $($FinalSecret.Version)"
+    Write-Host "State:          Provisioned"
+    Write-Host "Log:            $LogFile"
     Write-Host ""
-    Write-Host "Configuration completed successfully." `
-        -ForegroundColor Green
 }
 catch {
+    $OriginalError = $_.Exception
+
     Write-Log `
-        "Configuration failed: $($_.Exception.Message)" `
+        "Provisioning failed: $($OriginalError.Message)" `
         -Level "ERROR"
 
-    throw
+    #
+    # -----------------------------------------------------------------------
+    # Roll back only an AD computer created by this execution.
+    #
+    # Never remove a computer object that existed before the script started.
+    # -----------------------------------------------------------------------
+    #
+
+    if ($ComputerCreatedByThisRun) {
+        Write-Log (
+            "Attempting rollback of the newly created AD computer object."
+        ) -Level "WARNING"
+
+        try {
+            $RollbackComputer = Get-ADComputer `
+                -Identity $ComputerSamAccountName `
+                -ErrorAction Stop
+
+            Remove-ADComputer `
+                -Identity $RollbackComputer `
+                -Confirm:$false `
+                -ErrorAction Stop
+
+            Write-Log (
+                "Rollback succeeded. The newly created AD computer object " +
+                "was removed."
+            ) -Level "WARNING"
+        }
+        catch {
+            Write-Log (
+                "CRITICAL: rollback failed. The AD computer object may exist " +
+                "without a matching Key Vault secret. Rollback error: " +
+                $_.Exception.Message
+            ) -Level "ERROR"
+
+            throw (
+                "Provisioning failed and automatic rollback also failed. " +
+                "Inspect AD computer '$ComputerSamAccountName', Key Vault " +
+                "secret '$SecretName', and log '$LogFile'. Original error: " +
+                $OriginalError.Message
+            )
+        }
+    }
+
+    throw $OriginalError
 }
 finally {
     #
-    # Release sensitive-object references.
+    # Release references to secret material.
     #
-    $AccountPassword = $null
-    $Secret = $null
-
-    if ($null -ne $Stopwatch -and $Stopwatch.IsRunning) {
-        $Stopwatch.Stop()
-    }
+    $EnrollmentPasswordPlainText = $null
+    $EnrollmentPassword = $null
+    $KeyVaultSecret = $null
 
     if ($AzureConnected) {
         Disconnect-AzAccount `
