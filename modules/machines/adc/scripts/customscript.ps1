@@ -7,7 +7,7 @@ Install-ADDSForest `
   -CreateDnsDelegation:$false `
   -DatabasePath 'C:\windows\NTDS' `
   -DomainMode 'WinThreshold' `
-  -DomainName 'azurelinux.com' `
+  -DomainName 'ad22.newxyz.site' `
   -DomainNetbiosName 'AZURELINUX' `
   -ForestMode 'WinThreshold' `
   -InstallDns:$true `

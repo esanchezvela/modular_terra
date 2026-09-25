@@ -35,6 +35,10 @@ resource "azurerm_windows_virtual_machine" "machine" {
     admin_username         = "azureadmin"
     admin_password         = var.userpassword
 
+    identity {
+      type = "SystemAssigned"
+    }
+
     source_image_reference {
       publisher   = var.publisher
       offer       = var.offer
@@ -53,26 +57,11 @@ resource "azurerm_windows_virtual_machine" "machine" {
 }
 
 data template_file "adcsetup" {
-    template = file("${path.module}/customscript.ps1")
+    template = file("${path.module}/scripts/customscript.ps1")
     vars = {
         DOMAIN = var.custom_domain
     }
 }
-
-resource "azurerm_virtual_machine_extension" "adc_setup" {
-    count    =  var.adsetup ? 1 : 0
-    name = "ADC_Setup"
-    virtual_machine_id     = azurerm_windows_virtual_machine.machine.id
-    publisher              = "Microsoft.Compute"
-    type                   = "CustomScriptExtension"
-    type_handler_version   = "1.10"
-    settings               = <<SETTINGS
-       {
-         "commandToExecute" : "powershell -encodedCommand ${textencodebase64(data.template_file.adcsetup.rendered, "UTF-16LE")}" 
-       }
-    SETTINGS
-}
-
 
 resource "azurerm_dev_test_global_vm_shutdown_schedule" "schedule" {
     virtual_machine_id = azurerm_windows_virtual_machine.machine.id
@@ -93,6 +82,10 @@ output "machineid" {
 
 output "ip_address" {
   value = var.pubip ? azurerm_public_ip.public_ip_address[0].ip_address : null
+}
+
+output "identity" {
+  value = azurerm_windows_virtual_machine.machine.identity[0].principal_id
 }
 
 output "priv_address" {

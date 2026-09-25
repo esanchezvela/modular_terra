@@ -1,0 +1,386 @@
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+
+<#
+.SYNOPSIS
+    Bootstraps a Windows Server as a new AD DS forest and schedules
+    post-reboot Linux computer enrollment provisioning.
+
+.DESCRIPTION
+    This script:
+
+    1. Creates a persistent provisioning directory.
+    2. Writes the rendered post-reboot and enrollment scripts to disk.
+    3. Installs the required Azure PowerShell modules.
+    4. Retrieves the DSRM password from Azure Key Vault by using the VM's
+       managed identity.
+    5. Installs AD Domain Services.
+    6. Registers a SYSTEM startup task.
+    7. Creates the new AD forest without rebooting from inside the AD cmdlet.
+    8. Schedules a reboot after the bootstrap process exits.
+
+    No password is passed through Terraform or the Custom Script Extension.
+
+.NOTES
+    Corrected version. Fixes applied vs. the previous draft:
+      1. Repaired truncated static method calls
+         ([string]::IsNullOrWhiteSpace / [Convert]::FromBase64String).
+      2. Trust PSGallery before installing modules unattended.
+      3. Moved Azure cleanup (Disconnect-AzAccount / Clear-AzContext) into
+         'finally' so it runs on every exit path, not just the success path.
+      4. On a genuine promotion failure, unregister the scheduled task so it
+         does not retry forever on every subsequent reboot.
+#>
+
+[CmdletBinding()]
+param ()
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
+
+#
+# Values rendered safely with Terraform jsonencode().
+#
+$DomainName             = ${DOMAIN_NAME}
+$DomainNetbiosName      = ${DOMAIN_NETBIOS_NAME}
+$SubscriptionId         = ${SUBSCRIPTION_ID}
+$DsrmVaultName          = ${DSRM_VAULT_NAME}
+$DsrmSecretName         = ${DSRM_SECRET_NAME}
+$EnrollmentScriptBase64 = ${ENROLLMENT_SCRIPT_BASE64}
+$PostRebootBase64       = ${POST_REBOOT_SCRIPT_BASE64}
+
+$ProvisioningRoot = "C:\ProgramData\LinuxADProvisioning"
+$EnrollmentScript = Join-Path -Path $ProvisioningRoot -ChildPath "New-LinuxComputerEnrollment.ps1"
+$PostRebootScript = Join-Path -Path $ProvisioningRoot -ChildPath "Complete-LinuxEnrollment.ps1"
+$BootstrapLog     = Join-Path -Path $ProvisioningRoot -ChildPath "Bootstrap.log"
+$TaskName         = "Complete-Linux-AD-Provisioning"
+
+$AzureConnected = $false
+$DsrmPassword   = $null
+
+function Write-BootstrapLog {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Message,
+
+        [Parameter()]
+        [ValidateSet("INFO", "WARNING", "ERROR")]
+        [string]$Level = "INFO"
+    )
+
+    $Entry = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+
+    Add-Content -LiteralPath $script:BootstrapLog -Value $Entry -Encoding UTF8 -ErrorAction SilentlyContinue
+
+    Write-Host $Entry
+}
+
+function Install-RequiredPowerShellModule {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name
+    )
+
+    if (Get-Module -ListAvailable -Name $Name) {
+        Write-BootstrapLog "PowerShell module '$Name' is already installed."
+        return
+    }
+
+    Write-BootstrapLog "Installing PowerShell module '$Name'."
+
+    Install-Module `
+        -Name $Name `
+        -Repository "PSGallery" `
+        -Scope "AllUsers" `
+        -Force `
+        -AllowClobber `
+        -ErrorAction Stop
+}
+
+function Connect-AzureManagedIdentityWithRetry {
+    [CmdletBinding()]
+    param (
+        [Parameter()]
+        [ValidateRange(1, 20)]
+        [int]$MaximumAttempts = 10,
+
+        [Parameter()]
+        [ValidateRange(1, 300)]
+        [int]$DelaySeconds = 15
+    )
+
+    for ($Attempt = 1; $Attempt -le $MaximumAttempts; $Attempt++) {
+        try {
+            Write-BootstrapLog ("Managed-identity authentication attempt {0} of {1}." -f $Attempt, $MaximumAttempts)
+
+            Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+
+            $script:AzureConnected = $true
+
+            return
+        }
+        catch {
+            if ($Attempt -eq $MaximumAttempts) {
+                throw
+            }
+
+            Write-BootstrapLog ("Authentication attempt failed: {0}" -f $_.Exception.Message) -Level "WARNING"
+
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+}
+
+function Get-DsrmPasswordWithRetry {
+    [CmdletBinding()]
+    param (
+        [Parameter()]
+        [ValidateRange(1, 20)]
+        [int]$MaximumAttempts = 10,
+
+        [Parameter()]
+        [ValidateRange(1, 300)]
+        [int]$DelaySeconds = 15
+    )
+
+    for ($Attempt = 1; $Attempt -le $MaximumAttempts; $Attempt++) {
+        try {
+            Write-BootstrapLog ("DSRM secret retrieval attempt {0} of {1}." -f $Attempt, $MaximumAttempts)
+
+            $Secret = Get-AzKeyVaultSecret `
+                -VaultName $script:DsrmVaultName `
+                -Name $script:DsrmSecretName `
+                -ErrorAction Stop
+
+            if ($null -eq $Secret -or $null -eq $Secret.SecretValue) {
+                throw "Key Vault returned no DSRM secret value."
+            }
+
+            return $Secret.SecretValue
+        }
+        catch {
+            if ($Attempt -eq $MaximumAttempts) {
+                throw
+            }
+
+            Write-BootstrapLog ("DSRM secret retrieval failed: {0}" -f $_.Exception.Message) -Level "WARNING"
+
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+
+    throw "The DSRM password could not be retrieved."
+}
+
+function Write-Base64Script {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Base64Content,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Destination
+    )
+
+    try {
+        $Bytes = [Convert]::FromBase64String($Base64Content)
+    }
+    catch {
+        throw ("The content for '{0}' is not valid Base64: {1}" -f $Destination, $_.Exception.Message)
+    }
+
+    $Content = [Text.Encoding]::UTF8.GetString($Bytes)
+
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        throw "The decoded script content is empty: $Destination"
+    }
+
+    [IO.File]::WriteAllText($Destination, $Content, [Text.UTF8Encoding]::new($false))
+}
+
+function Remove-ProvisioningTask {
+    [CmdletBinding()]
+    param ()
+
+    $ExistingTask = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
+
+    if ($null -ne $ExistingTask) {
+        Write-BootstrapLog ("Removing scheduled task '{0}' after a failed bootstrap." -f $script:TaskName) -Level "WARNING"
+
+        Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
+try {
+    if (-not (Test-Path -LiteralPath $ProvisioningRoot)) {
+        New-Item -ItemType Directory -Path $ProvisioningRoot -Force -ErrorAction Stop | Out-Null
+    }
+
+    Write-BootstrapLog "Starting AD DS bootstrap."
+
+    if ([string]::IsNullOrWhiteSpace($DomainName)) {
+        throw "DomainName is empty."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DomainNetbiosName)) {
+        throw "DomainNetbiosName is empty."
+    }
+
+    if ($DomainNetbiosName.Length -gt 15) {
+        throw "The NetBIOS domain name cannot exceed 15 characters."
+    }
+
+    Write-BootstrapLog "Writing persistent provisioning scripts."
+
+    Write-Base64Script -Base64Content $EnrollmentScriptBase64 -Destination $EnrollmentScript
+    Write-Base64Script -Base64Content $PostRebootBase64 -Destination $PostRebootScript
+
+    #
+    # Use TLS 1.2 for PowerShell Gallery access.
+    #
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+        Write-BootstrapLog "Installing the NuGet package provider."
+
+        Install-PackageProvider -Name NuGet -MinimumVersion "2.8.5.201" -Force -ErrorAction Stop | Out-Null
+    }
+
+    #
+    # Trust PSGallery so unattended Install-Module calls do not prompt.
+    #
+    $GalleryRegistration = Get-PSRepository -Name "PSGallery" -ErrorAction SilentlyContinue
+
+    if ($null -ne $GalleryRegistration -and $GalleryRegistration.InstallationPolicy -ne "Trusted") {
+        Write-BootstrapLog "Trusting the PSGallery repository."
+
+        Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted -ErrorAction Stop
+    }
+
+    Install-RequiredPowerShellModule -Name "Az.Accounts"
+    Install-RequiredPowerShellModule -Name "Az.KeyVault"
+
+    Import-Module Az.Accounts -ErrorAction Stop
+    Import-Module Az.KeyVault -ErrorAction Stop
+
+    Disable-AzContextAutosave -Scope Process -ErrorAction Stop | Out-Null
+    Clear-AzContext -Scope Process -Force -ErrorAction SilentlyContinue
+
+    Connect-AzureManagedIdentityWithRetry
+
+    if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
+        Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+    }
+
+    $DsrmPassword = Get-DsrmPasswordWithRetry
+
+    Write-BootstrapLog "Installing AD Domain Services."
+
+    $FeatureResult = Install-WindowsFeature -Name "AD-Domain-Services" -IncludeManagementTools -ErrorAction Stop
+
+    if (-not $FeatureResult.Success) {
+        throw "AD Domain Services installation did not report success."
+    }
+
+    #
+    # Register the task before forest promotion so it is available
+    # immediately after the upcoming reboot.
+    #
+    Write-BootstrapLog "Registering the post-reboot provisioning task."
+
+    $TaskAction = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $PostRebootScript)
+
+    $TaskTrigger = New-ScheduledTaskTrigger -AtStartup
+
+    $TaskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+    $TaskSettings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+        -RestartCount 5 `
+        -RestartInterval (New-TimeSpan -Minutes 2)
+
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $TaskAction `
+        -Trigger $TaskTrigger `
+        -Principal $TaskPrincipal `
+        -Settings $TaskSettings `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    #
+    # If NTDS already exists, this system has already been promoted.
+    # Simply kick the post-reboot task rather than repeating promotion.
+    #
+    $NtdsService = Get-Service -Name "NTDS" -ErrorAction SilentlyContinue
+
+    if ($null -ne $NtdsService) {
+        Write-BootstrapLog "NTDS already exists. Forest promotion is not repeated." -Level "WARNING"
+
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+
+        return
+    }
+
+    Write-BootstrapLog "Creating new Active Directory forest '$DomainName'."
+
+    Import-Module ADDSDeployment -ErrorAction Stop
+
+    Install-ADDSForest `
+        -DomainName $DomainName `
+        -DomainNetbiosName $DomainNetbiosName `
+        -SafeModeAdministratorPassword $DsrmPassword `
+        -InstallDns:$true `
+        -CreateDnsDelegation:$false `
+        -DatabasePath "C:\Windows\NTDS" `
+        -LogPath "C:\Windows\NTDS" `
+        -SysvolPath "C:\Windows\SYSVOL" `
+        -DomainMode "WinThreshold" `
+        -ForestMode "WinThreshold" `
+        -NoRebootOnCompletion:$true `
+        -Force:$true `
+        -ErrorAction Stop
+
+    Write-BootstrapLog "Forest promotion completed. The server will restart in 60 seconds."
+
+    Start-Process `
+        -FilePath "$env:SystemRoot\System32\shutdown.exe" `
+        -ArgumentList "/r /t 60 /f /c `"Completing Active Directory provisioning`"" `
+        -WindowStyle Hidden
+
+    Write-BootstrapLog "Bootstrap completed successfully."
+}
+catch {
+    Write-BootstrapLog -Message "Bootstrap failed: $($_.Exception.Message)" -Level "ERROR"
+
+    #
+    # A genuine failure (not merely a readiness timeout) should not leave a
+    # scheduled task that keeps retrying forever on every future reboot.
+    #
+    Remove-ProvisioningTask
+
+    throw
+}
+finally {
+    #
+    # Release the DSRM SecureString reference as soon as possible.
+    #
+    $DsrmPassword = $null
+
+    #
+    # Clean up the Azure session on every exit path, success or failure.
+    #
+    if ($AzureConnected) {
+        Disconnect-AzAccount -Scope Process -ErrorAction SilentlyContinue | Out-Null
+        Clear-AzContext -Scope Process -Force -ErrorAction SilentlyContinue
+    }
+}

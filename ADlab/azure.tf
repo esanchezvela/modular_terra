@@ -6,6 +6,10 @@ terraform {
     azurerm = {
       source = "hashicorp/azurerm"
     }
+
+    random = {
+      source = "hashicorp/random"
+    }
   }
 
 }

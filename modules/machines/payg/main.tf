@@ -40,6 +40,10 @@ resource "azurerm_linux_virtual_machine" "machine" {
     disk_controller_type   = var.disk_controller_type
     availability_set_id    = var.avsetid 
 
+    identity { 
+      type = "SystemAssigned"
+    }
+
     source_image_reference {
       publisher   = var.publisher
       offer       = var.offer
@@ -83,4 +87,8 @@ output "machine" {
 
 output "ip_address" {
   value = var.pubip ? azurerm_public_ip.public_ip_address[0].ip_address : null
+}
+
+output "identity" {
+  value = azurerm_linux_virtual_machine.machine.identity[0].principal_id
 }

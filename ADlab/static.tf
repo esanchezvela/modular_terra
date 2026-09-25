@@ -1,43 +1,45 @@
 
-module "controller25" {
-  source = "../modules/machines/adc"
-  depends_on = [
-    module.myrg,
-    module.network_ad2022
-  ]
-
-  server_name   = "controller25"
-  nic0_ip       = cidrhost(module.network_ad2022.subnets_cidrs[0], 5)
-  nic0_subnetid = module.network_ad2022.subnets_ids[0]
-
-  pubip         = true
-  publisher     = "MicrosoftWindowsServer"
-  offer         = "WindowsServer"
-  sku           = "2025-datacenter-g2"
-  image_version = "latest"
-
-  userpassword = var.userpassword
-
-  size = "Standard_D4s_v4"
-
-  resource_group  = var.rg_name
-  storage_account = null
-  location        = var.location
-  adsetup         = true
-  custom_domain   = "CONTOSOII.COM"
-
-}
+#module "controller25" {
+#  source = "../modules/machines/adc"
+#  depends_on = [
+#    module.myrg,
+#    azurerm_subnet_network_security_group_association.network_ad2022_nsg_asocc,
+#    module.network_ad2025
+#  ]
+#
+#  server_name   = "controller25"
+#  nic0_ip       = cidrhost(module.network_ad2025.subnets_cidrs[0], 5)
+#  nic0_subnetid = module.network_ad2025.subnets_ids[0]
+#
+#  pubip         = true
+#  publisher     = "MicrosoftWindowsServer"
+#  offer         = "WindowsServer"
+#  sku           = "2025-datacenter-g2"
+#  image_version = "latest"
+#
+#  userpassword = var.userpassword
+#
+#  size = "Standard_D4s_v4"
+#
+#  resource_group  = var.rg_name
+#  storage_account = null
+#  location        = var.location
+#  adsetup         = true
+#  custom_domain   = "AD25.NEWXYZ.SITE"
+#
+#}
 
 module "controller22" {
   source = "../modules/machines/adc"
   depends_on = [
     module.myrg,
-    module.network_ad2025
+    azurerm_subnet_network_security_group_association.network_ad2022_nsg_asocc,
+    module.network_ad2022
   ]
 
   server_name   = "controller22"
-  nic0_ip       = cidrhost(module.network_ad2025.subnets_cidrs[0], 5)
-  nic0_subnetid = module.network_ad2025.subnets_ids[0]
+  nic0_ip       = cidrhost(module.network_ad2022.subnets_cidrs[0], 5)
+  nic0_subnetid = module.network_ad2022.subnets_ids[0]
 
   pubip         = true
   publisher     = "MicrosoftWindowsServer"
@@ -53,10 +55,9 @@ module "controller22" {
   resource_group  = var.rg_name
   location        = var.location
   adsetup         = true
-  custom_domain   = "CONTOSOI.COM"
+  custom_domain   = var.custom_domain
 
 }
-
 
 module "jumphost" {
 
