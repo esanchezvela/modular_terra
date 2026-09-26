@@ -1,7 +1,12 @@
 locals {
   computer_names = [
-   for vm in var.payg: vm.name 
+   for vm in var.payg: trimspace(vm.name)
   ]
+
+  provisioning_root = "C:\\ProgramData\\LinuxADProvisioning"
+  enrollment_log    = "C:\\Logs\\Linux-Computer-Provisioning.log"
+
+  dsrm_secret_name = "ad-dsrm-password" 
 
   enrollment_script = templatefile(
     "${path.module}/LinuxComputerEnrollment.ps1.tftpl",
@@ -30,31 +35,4 @@ locals {
       POST_REBOOT_SCRIPT_BASE64 = jsonencode(base64encode(local.post_reboot_script))
     }
   )
-}
-
-resource "azurerm_virtual_machine_extension" "ad_bootstrap" {
-  name               = "ADDS-Bootstrap"
-  virtual_machine_id = module.controller22.machineid
-
-  publisher            = "Microsoft.Compute"
-  type                 = "CustomScriptExtension"
-  type_handler_version = "1.10"
-
-  protected_settings = jsonencode({
-    commandToExecute = join(" ", [
-      "powershell.exe",
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy Bypass",
-      "-EncodedCommand",
-      textencodebase64(local.bootstrap_script, "UTF-16LE")
-    ])
-  })
-
-  depends_on = [
-    module.controller22,
-    azurerm_key_vault_secret.dsrm,
-    azurerm_role_assignment.windows_secrets_officer
-  ]
 }

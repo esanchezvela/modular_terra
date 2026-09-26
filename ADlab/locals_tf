@@ -1,0 +1,60 @@
+locals {
+  #
+  # Use normalized computer names as stable keys.
+  #
+  linux_vms = {
+    for vm in var.payg :
+    upper(trimspace(vm.computer_name)) => vm
+  }
+
+  computer_names = sort(keys(local.linux_vms))
+
+  provisioning_root = "C:\\ProgramData\\LinuxADProvisioning"
+  enrollment_log    = "C:\\Logs\\Linux-Computer-Provisioning.log"
+
+  #
+  # Render the AD computer-account and enrollment-secret provisioning script.
+  #
+  enrollment_script = templatefile(
+    "${path.module}/scripts/LinuxComputerEnrollment.ps1.tftpl",
+    {
+      #
+      # The first jsonencode creates the JSON array.
+      # The second jsonencode creates a valid PowerShell string literal
+      # containing that JSON.
+      #
+      COMPUTER_NAMES_JSON = jsonencode(jsonencode(local.computer_names))
+      COMPUTER_OU = jsonencode(var.computer_ou)
+      KEY_VAULT_NAME = jsonencode(azurerm_key_vault.domain_join.name)
+      SUBSCRIPTION_ID = jsonencode(var.subscription_id)
+      LOG_FILE = jsonencode(local.enrollment_log)
+    }
+  )
+
+  #
+  # This is ordinary PowerShell and does not require Terraform substitution.
+  #
+  post_reboot_script = file(
+    "${path.module}/scripts/Complete-LinuxEnrollment.ps1"
+  )
+
+  #
+  # Render the initial AD DS bootstrap.
+  #
+  bootstrap_script = templatefile(
+    "${path.module}/scripts/Bootstrap-ADDS.ps1.tftpl",
+    {
+      DOMAIN_NAME = jsonencode(var.custom_domain)
+      DOMAIN_NETBIOS_NAME = jsonencode(upper(var.domain_netbios_name))
+      SUBSCRIPTION_ID = jsonencode(var.subscription_id)
+      DSRM_VAULT_NAME = jsonencode(azurerm_key_vault.domain_join.name)
+      DSRM_SECRET_NAME = jsonencode(azurerm_key_vault_secret.dsrm.name)
+      #
+      # Encode the fully rendered child scripts so the bootstrap can write
+      # them safely to local files without quoting collisions.
+      #
+      ENROLLMENT_SCRIPT_BASE64 = jsonencode(base64encode(local.enrollment_script))
+      POST_REBOOT_SCRIPT_BASE64 = jsonencode(base64encode(local.post_reboot_script))
+    }
+  )
+}

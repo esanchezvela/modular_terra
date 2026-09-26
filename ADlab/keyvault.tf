@@ -1,10 +1,9 @@
 
 
-data "azurerm_client_config" "current" {}
-
 resource "azurerm_key_vault" "domain_join" {
 
   depends_on          = [module.myrg]
+
   name                = "${var.prefix}vault${random_id.randomId.hex}"
   location            = var.location
   resource_group_name = var.rg_name
@@ -22,46 +21,6 @@ resource "azurerm_key_vault" "domain_join" {
   }
 }
 
-resource "azurerm_private_dns_zone" "dns" {
-  depends_on          = [module.myrg]
-  name                = "privatelink.vaultcore.azure.net"
-  resource_group_name = var.rg_name
-}
-
-resource "azurerm_private_endpoint" "pep" {
-  depends_on = [
-    module.myrg,
-    module.network_ad2022
-  ]
-  name                = "kv-pep"
-  location            = var.location
-  resource_group_name = var.rg_name
-  subnet_id           = module.network_ad2022.subnets_ids[0]
-
-  private_service_connection {
-    name                           = "kv-connection"
-    is_manual_connection           = false
-    private_connection_resource_id = azurerm_key_vault.domain_join.id
-    subresource_names              = ["vault"]
-  }
-
-  private_dns_zone_group {
-    name                 = "dns-group"
-    private_dns_zone_ids = [azurerm_private_dns_zone.dns.id]
-  }
-}
-
-resource "azurerm_role_assignment" "windows_secrets_officer" {
-  depends_on  =  [
-                   module.myrg,
-                   module.controller22
-                 ]
-
-  scope                = azurerm_key_vault.domain_join.id
-  role_definition_name = "Key Vault Secrets Officer"
-  principal_id         = module.controller22.identity
-}
-
 resource "random_password" "dsrm" {
   length = 32
 
@@ -71,10 +30,6 @@ resource "random_password" "dsrm" {
    special = true
 
    override_special = "!#$%&*+-.:=?@_"
-}
-
-locals {
-  dsrm_secret_name = "ad-dsrm-password"
 }
 
 resource "azurerm_key_vault_secret" "dsrm" {
