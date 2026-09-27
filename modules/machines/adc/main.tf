@@ -17,8 +17,7 @@ resource "azurerm_network_interface" "nic0" {
   ip_configuration {
     name                           = "${var.server_name}-eth0_priv"
     subnet_id                      = var.nic0_subnetid
-    private_ip_address_allocation  = "Static"
-    private_ip_address             = var.nic0_ip
+    private_ip_address_allocation  = "Dynamic"
     primary                        = "true"
     public_ip_address_id           = var.pubip ? azurerm_public_ip.public_ip_address[0].id : null
   }
@@ -56,13 +55,6 @@ resource "azurerm_windows_virtual_machine" "machine" {
     }
 }
 
-data template_file "adcsetup" {
-    template = file("${path.module}/scripts/customscript.ps1")
-    vars = {
-        DOMAIN = var.custom_domain
-    }
-}
-
 resource "azurerm_dev_test_global_vm_shutdown_schedule" "schedule" {
     virtual_machine_id = azurerm_windows_virtual_machine.machine.id
     location           = azurerm_windows_virtual_machine.machine.location
@@ -89,5 +81,5 @@ output "identity" {
 }
 
 output "priv_address" {
-  value = var.nic0_ip
+  value = azurerm_network_interface.nic0.private_ip_address
 }

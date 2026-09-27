@@ -1,21 +1,22 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 <#
 .SYNOPSIS
-    Post-reboot continuation script. Waits for AD DS to become ready, then
-    runs the Linux computer enrollment provisioning script.
+    Post-reboot continuation for the ADlab controller22 deployment.
+
+.DESCRIPTION
+    Waits for Active Directory Domain Services on the newly promoted domain
+    controller to become operational, verifies the local DC, DNS registration,
+    SYSVOL and NETLOGON, runs the staged Linux computer enrollment script, and
+    removes the startup task only after successful completion.
 
 .NOTES
-    Corrected version. Fixes applied vs. the previous draft:
-      1. The enrollment script must use 'return' rather than 'exit' when it
-         has nothing to do. 'exit' terminates the entire powershell.exe
-         process this script runs in, which would prevent the success log
-         entry and the Unregister-ScheduledTask call below from running,
-         causing the task to keep firing on every future boot.
-      2. The scheduled task is only unregistered after a fully successful
-         run; any failure leaves it registered so its restart settings (or
-         the next reboot) can retry.
+    Designed to be staged by Bootstrap-ADDS.ps1 under:
+      C:\ProgramData\LinuxADProvisioning
+
+    Failure intentionally leaves the scheduled task registered so the workflow
+    can retry after a subsequent reboot or manual task start.
 #>
 
 [CmdletBinding()]
@@ -23,15 +24,19 @@ param ()
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
-$TaskName = "Complete-Linux-AD-Provisioning"
+$TaskName          = "Complete-Linux-AD-Provisioning"
+$ProvisioningRoot  = "C:\ProgramData\LinuxADProvisioning"
+$EnrollmentScript  = Join-Path -Path $ProvisioningRoot -ChildPath "LinuxComputerEnrollment.ps1"
+$LogFile           = Join-Path -Path $ProvisioningRoot -ChildPath "PostReboot.log"
+$DcDiagLog         = Join-Path -Path $ProvisioningRoot -ChildPath "dcdiag.log"
+$SuccessMarker     = Join-Path -Path $ProvisioningRoot -ChildPath "ADDS-Provisioning-Complete.txt"
+$FailureMarker     = Join-Path -Path $ProvisioningRoot -ChildPath "ADDS-Provisioning-Failed.txt"
 
-$ProvisioningRoot = "C:\ProgramData\LinuxADProvisioning"
-$EnrollmentScript = Join-Path -Path $ProvisioningRoot -ChildPath "New-LinuxComputerEnrollment.ps1"
-$LogFile          = Join-Path -Path $ProvisioningRoot -ChildPath "PostReboot.log"
-
-$MaximumWait = New-TimeSpan -Minutes 30
-$Stopwatch   = [Diagnostics.Stopwatch]::StartNew()
+$MaximumWait       = New-TimeSpan -Minutes 30
+$RetryInterval     = New-TimeSpan -Seconds 10
+$Stopwatch         = [Diagnostics.Stopwatch]::StartNew()
 
 function Write-PostRebootLog {
     [CmdletBinding()]
@@ -41,37 +46,78 @@ function Write-PostRebootLog {
         [string]$Message,
 
         [Parameter()]
-        [ValidateSet("INFO", "WARNING", "ERROR")]
+        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS")]
         [string]$Level = "INFO"
     )
 
-    $Entry = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    $entry = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
 
-    Add-Content -LiteralPath $script:LogFile -Value $Entry -Encoding UTF8 -ErrorAction SilentlyContinue
+    try {
+        Add-Content -LiteralPath $script:LogFile -Value $entry -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Unable to write post-reboot log: $($_.Exception.Message)"
+    }
 
-    Write-Host $Entry
+    switch ($Level) {
+        "WARNING" { Write-Host $entry -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $entry -ForegroundColor Red }
+        "SUCCESS" { Write-Host $entry -ForegroundColor Green }
+        default   { Write-Host $entry }
+    }
+}
+
+function Test-ServiceRunning {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name
+    )
+
+    try {
+        $service = Get-Service -Name $Name -ErrorAction Stop
+        return $service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running
+    }
+    catch {
+        return $false
+    }
 }
 
 function Test-ActiveDirectoryReady {
     [CmdletBinding()]
     param ()
 
-    $Ntds = Get-Service -Name "NTDS" -ErrorAction SilentlyContinue
-    $Adws = Get-Service -Name "ADWS" -ErrorAction SilentlyContinue
-
-    $NtdsReady = ($null -ne $Ntds -and $Ntds.Status -eq "Running")
-    $AdwsReady = ($null -ne $Adws -and $Adws.Status -eq "Running")
-
-    if (-not ($NtdsReady -and $AdwsReady)) {
-        return $false
-    }
-
     try {
+        foreach ($serviceName in @("NTDS", "DNS", "Netlogon")) {
+            if (-not (Test-ServiceRunning -Name $serviceName)) {
+                return $false
+            }
+        }
+
         Import-Module ActiveDirectory -ErrorAction Stop
 
-        $Domain = Get-ADDomain -ErrorAction Stop
+        $domain = Get-ADDomain -ErrorAction Stop
+        $forest = Get-ADForest -ErrorAction Stop
+        $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
 
-        return $null -ne $Domain
+        if ([string]::IsNullOrWhiteSpace($domain.DNSRoot)) { return $false }
+        if ([string]::IsNullOrWhiteSpace($forest.Name)) { return $false }
+        if ($dc -eq $null) { return $false }
+
+        $srvName = "_ldap._tcp.dc._msdcs.{0}" -f $domain.DNSRoot
+        $srv = @(Resolve-DnsName -Name $srvName -Type SRV -ErrorAction Stop)
+        if ($srv.Count -eq 0) { return $false }
+
+        $shareNames = @(
+            Get-SmbShare -ErrorAction Stop |
+                Select-Object -ExpandProperty Name
+        )
+
+        if ($shareNames -notcontains "SYSVOL") { return $false }
+        if ($shareNames -notcontains "NETLOGON") { return $false }
+
+        return $true
     }
     catch {
         return $false
@@ -79,55 +125,107 @@ function Test-ActiveDirectoryReady {
 }
 
 try {
-    Write-PostRebootLog "Starting post-reboot provisioning."
-
-    if (-not (Test-Path -LiteralPath $EnrollmentScript -PathType Leaf)) {
-        throw "Enrollment script was not found: $EnrollmentScript"
+    if (-not (Test-Path -LiteralPath $ProvisioningRoot)) {
+        New-Item -ItemType Directory -Path $ProvisioningRoot -Force -ErrorAction Stop | Out-Null
     }
 
-    while (-not (Test-ActiveDirectoryReady) -and $Stopwatch.Elapsed -lt $MaximumWait) {
-        Write-PostRebootLog "Active Directory is not ready. Retrying in 15 seconds." -Level "WARNING"
+    Remove-Item -LiteralPath $FailureMarker -Force -ErrorAction SilentlyContinue
 
-        Start-Sleep -Seconds 15
+    Write-PostRebootLog -Message "Starting post-reboot provisioning."
+    Write-PostRebootLog -Message "Computer: $env:COMPUTERNAME"
+    Write-PostRebootLog -Message "Waiting for AD DS, DNS, Netlogon, AD queries, DNS SRV records, SYSVOL, and NETLOGON."
+
+    while ($Stopwatch.Elapsed -lt $MaximumWait) {
+        if (Test-ActiveDirectoryReady) {
+            Write-PostRebootLog -Message "Active Directory readiness checks passed." -Level "SUCCESS"
+            break
+        }
+
+        Write-PostRebootLog -Message (
+            "Active Directory is not ready yet. Elapsed: {0:n0} seconds." -f $Stopwatch.Elapsed.TotalSeconds
+        ) -Level "WARNING"
+
+        Start-Sleep -Seconds ([int]$RetryInterval.TotalSeconds)
     }
 
     if (-not (Test-ActiveDirectoryReady)) {
-        throw "Active Directory did not become ready within 30 minutes."
+        throw "Active Directory did not become ready within $([int]$MaximumWait.TotalMinutes) minutes."
     }
 
-    Write-PostRebootLog "Active Directory is ready."
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $domain = Get-ADDomain -ErrorAction Stop
+    $forest = Get-ADForest -ErrorAction Stop
+    $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
 
-    foreach ($ModuleName in @("ActiveDirectory", "Az.Accounts", "Az.KeyVault")) {
-        if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
-            throw "Required PowerShell module is unavailable: $ModuleName"
-        }
+    Write-PostRebootLog -Message "Domain verified: $($domain.DNSRoot)" -Level "SUCCESS"
+    Write-PostRebootLog -Message "Forest verified: $($forest.Name)" -Level "SUCCESS"
+    Write-PostRebootLog -Message "Domain controller verified: $($dc.HostName)" -Level "SUCCESS"
 
-        Import-Module -Name $ModuleName -ErrorAction Stop
+    Write-PostRebootLog -Message "Running DCDIAG connectivity, advertising, services, and DNS checks."
+
+    $dcDiagOutput = & dcdiag.exe /test:Connectivity /test:Advertising /test:Services /test:DNS 2>&1
+    $dcDiagExitCode = $LASTEXITCODE
+    $dcDiagOutput | Out-File -LiteralPath $DcDiagLog -Encoding UTF8 -Force
+
+    if ($dcDiagExitCode -ne 0) {
+        throw "DCDIAG returned exit code $dcDiagExitCode. Review '$DcDiagLog'."
     }
 
-    Write-PostRebootLog "Starting Linux computer enrollment."
+    Write-PostRebootLog -Message "DCDIAG completed successfully." -Level "SUCCESS"
 
-    #
-    # Note: New-LinuxComputerEnrollment.ps1 must use 'return' (not 'exit')
-    # for its "nothing to do" early-out path, since 'exit' would terminate
-    # this entire powershell.exe process, including the code below.
-    #
+    if (-not (Test-Path -LiteralPath $EnrollmentScript -PathType Leaf)) {
+        throw "Linux enrollment script was not found at '$EnrollmentScript'."
+    }
+
+    Write-PostRebootLog -Message "Starting Linux computer enrollment script '$EnrollmentScript'."
+
     & $EnrollmentScript
+    $EnrollmentExitCode = $LASTEXITCODE
 
-    Write-PostRebootLog "Linux computer enrollment completed successfully."
+    if ($EnrollmentExitCode -ne $null -and $EnrollmentExitCode -ne 0) {
+        throw "Linux enrollment script returned exit code $EnrollmentExitCode."
+    }
+
+    Write-PostRebootLog -Message "Linux computer enrollment completed successfully." -Level "SUCCESS"
+
+    @"
+AD DS post-reboot provisioning completed successfully.
+Computer=$env:COMPUTERNAME
+Domain=$($domain.DNSRoot)
+Forest=$($forest.Name)
+DomainController=$($dc.HostName)
+Completed=$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+DCDIAGExitCode=$dcDiagExitCode
+"@ | Set-Content -LiteralPath $SuccessMarker -Encoding UTF8 -Force
+
+    Write-PostRebootLog -Message "Success marker written to '$SuccessMarker'." -Level "SUCCESS"
 
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    Write-PostRebootLog -Message "Scheduled task '$TaskName' removed after successful completion." -Level "SUCCESS"
 
-    Write-PostRebootLog "Post-reboot scheduled task removed successfully."
+    exit 0
 }
 catch {
-    Write-PostRebootLog -Message "Post-reboot provisioning failed: $($_.Exception.Message)" -Level "ERROR"
+    $errorMessage = $_.Exception.Message
 
-    #
-    # Keep the scheduled task registered so its restart settings or the next
-    # reboot can retry the operation.
-    #
-    throw
+    Write-PostRebootLog -Message "Post-reboot provisioning failed: $errorMessage" -Level "ERROR"
+
+    @"
+AD DS post-reboot provisioning failed.
+Computer=$env:COMPUTERNAME
+Time=$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+Error=$errorMessage
+
+Review:
+$LogFile
+$DcDiagLog
+C:\Windows\debug\dcpromo.log
+C:\Windows\debug\dcpromoui.log
+"@ | Set-Content -LiteralPath $FailureMarker -Encoding UTF8 -Force
+
+    # Intentionally retain the scheduled task on failure so the workflow can
+    # retry on a later boot or when the task is started manually.
+    exit 1
 }
 finally {
     $Stopwatch.Stop()

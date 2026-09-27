@@ -357,11 +357,11 @@ try {
     Write-BootstrapLog "Starting Active Directory bootstrap."
     Write-BootstrapLog "Extension working directory: $PSScriptRoot"
 
-    if (:IsNullOrWhiteSpace($DomainName)) {
+    if ([string]::IsNullOrWhiteSpace($DomainName)) {
         throw "DomainName is empty."
     }
 
-    if (:IsNullOrWhiteSpace($DomainNetbiosName)) {
+    if ([string]::IsNullOrWhiteSpace($DomainNetbiosName)) {
         throw "DomainNetbiosName is empty."
     }
 
@@ -437,7 +437,7 @@ try {
 
     Connect-AzureManagedIdentityWithRetry
 
-    if (-not :IsNullOrWhiteSpace($SubscriptionId)) {
+    if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
         Set-AzContext `
             -SubscriptionId $SubscriptionId `
             -ErrorAction Stop | Out-Null

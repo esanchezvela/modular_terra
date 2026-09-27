@@ -11,5 +11,5 @@ variable "computer_ou" {
 
 variable "domain_netbios_name" {
   description = "Domain NETBIOS Name"
-  default = "OU=AD22NEWXYZ"
+  default = "AD22NEWXYZ"
 }

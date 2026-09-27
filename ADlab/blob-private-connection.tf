@@ -1,5 +1,5 @@
 ################################################################################
-# Blob Private DNS Zone 
+# Blob Private DNS Zone
 #
 #
 # <storage-account>.blob.core.windows.net
@@ -15,7 +15,7 @@ resource "azurerm_private_dns_zone" "blob" {
   resource_group_name = var.rg_name
 }
 
-resource "azurerm_private_endpoint" "pep_stg" {
+resource "azurerm_private_endpoint" "blob" {
   depends_on = [
     module.myrg,
     module.network_ad2022
@@ -30,7 +30,7 @@ resource "azurerm_private_endpoint" "pep_stg" {
     name             = "stg-connection"
     is_manual_connection  = false
     private_connection_resource_id  = azurerm_storage_account.provisioning.id
-    subresourc_names = ["blob"]
+    subresource_names = ["blob"]
   }
 
   private_dns_zone_group {
@@ -43,36 +43,15 @@ resource "azurerm_private_endpoint" "pep_stg" {
 # Link Private DNS Zone to VNET
 ################################################################################
 resource "azurerm_private_dns_zone_virtual_network_link" "blob" {
-  name = "${var.storage_account_name}-blob-vnet-link"
+  depends_on = [
+    module.myrg,
+    module.network_ad2022
+  ]
 
-  resource_group_name = var.rg_name
-  private_dns_zone_name = azurerm_private_dns_zone.blob.name
+  name = "${azurerm_storage_account.provisioning.name}-blob-vnet-link"
 
-  virtual_network_id = var.virtual_network_id
+  private_dns_zone_id = azurerm_private_dns_zone.blob.id
+  virtual_network_id = module.network_ad2022.network_id
 
   registration_enabled = false
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -10,6 +10,10 @@ terraform {
       version = ">= 4.0, < 6.0"
     }
 
+    time = {
+      source = "hashicorp/time"
+    }
+
     random = {
       source = "hashicorp/random"
       version = ">= 3.6, < 4.0"
@@ -29,4 +33,5 @@ provider "azurerm" {
       purge_soft_deleted_secrets_on_destroy = true
     }
   }
+  storage_use_azuread  = true
 }

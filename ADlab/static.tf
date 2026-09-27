@@ -8,7 +8,6 @@
 #  ]
 #
 #  server_name   = "controller25"
-#  nic0_ip       = cidrhost(module.network_ad2025.subnets_cidrs[0], 5)
 #  nic0_subnetid = module.network_ad2025.subnets_ids[0]
 #
 #  pubip         = true
@@ -25,7 +24,6 @@
 #  storage_account = null
 #  location        = var.location
 #  adsetup         = true
-#  custom_domain   = "AD25.NEWXYZ.SITE"
 #
 #}
 
@@ -38,7 +36,6 @@ module "controller22" {
   ]
 
   server_name   = "controller22"
-  nic0_ip       = cidrhost(module.network_ad2022.subnets_cidrs[0], 5)
   nic0_subnetid = module.network_ad2022.subnets_ids[0]
 
   pubip         = true
@@ -54,8 +51,6 @@ module "controller22" {
   storage_account = null
   resource_group  = var.rg_name
   location        = var.location
-  adsetup         = true
-  custom_domain   = var.custom_domain
 
 }
 

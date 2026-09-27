@@ -15,13 +15,6 @@ variable "resource_group" {
   type        = string
 }
 
-
-variable "nic0_ip" {
-  description = "NIC IP address"
-  type        = string
-}
-
-
 variable "nic0_subnetid" {
   description = "NICs subnet ID"
   type        = string
@@ -75,10 +68,4 @@ variable "image_version" {
   description = "Image version"
   type        = string
   default     = "latest"
-}
-
-variable "custom_domain" {
-  description = "Domain name to generate"
-  type        = string
-  default     = "azurelinux.com"
 }

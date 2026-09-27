@@ -1,3 +1,0 @@
-{
-"commandToExecute" : "Get-WindowsFeature -Name *rsat* | Install-WindowsFeature; exit 0"
-}
