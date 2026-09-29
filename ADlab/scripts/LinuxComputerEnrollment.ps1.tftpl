@@ -4,13 +4,20 @@
 
 <#
 .SYNOPSIS
-    Prestages multiple Active Directory computer accounts and stores each
-    computer's initial enrollment password in Azure Key Vault.
+    Prestages Linux computer accounts in Active Directory and stores each
+    newly generated computer-account password in Azure Key Vault.
+
 .DESCRIPTION
-    Terraform injects a JSON array of computer names. For each computer:
-      AD absent + secret absent   -> create both.
-      AD present + secret present -> no-op.
-      Only one present            -> fail safe without changing either.
+    For each computer name supplied by Terraform:
+      1. Ensure the target OU exists, creating the final OU level if needed.
+      2. Check Active Directory for the computer sAMAccountName.
+      3. If the computer already exists, skip it.
+      4. Otherwise generate a password, create the enabled AD computer, and
+         store the same password in Key Vault.
+      5. If Key Vault storage fails, remove only the AD object created by this
+         invocation.
+
+    This template is compatible with Windows PowerShell 5.1.
 #>
 
 [CmdletBinding()]
@@ -19,7 +26,8 @@ param ()
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
-$ComputerNamesJson = ${COMPUTER_NAMES_JSON}
+# Terraform renders COMPUTER_NAMES_JSON with jsonencode() exactly once.
+$ComputerNamesJson = '${COMPUTER_NAMES_JSON}'
 $ComputerOU        = ${COMPUTER_OU}
 $VaultName         = ${KEY_VAULT_NAME}
 $SubscriptionId    = ${SUBSCRIPTION_ID}
@@ -29,270 +37,506 @@ $PasswordLength = 64
 $AzureConnected = $false
 
 function Write-Log {
-    param(
-        [Parameter(Mandatory)][string]$Message,
-        [ValidateSet("INFO","WARNING","ERROR")][string]$Level = "INFO"
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Message,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("INFO", "WARNING", "ERROR")]
+        [string]$Level = "INFO"
     )
-    $entry = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    try { Add-Content -LiteralPath $script:LogFile -Value $entry -Encoding UTF8 -ErrorAction Stop }
-    catch { Write-Warning "Unable to write log: $($_.Exception.Message)" }
+
+    $Entry = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+
+    try {
+        Add-Content -LiteralPath $script:LogFile -Value $Entry -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        Write-Warning ("Unable to write to log file '{0}': {1}" -f $script:LogFile, $_.Exception.Message)
+    }
+
     switch ($Level) {
-        "WARNING" { Write-Host $entry -ForegroundColor Yellow }
-        "ERROR"   { Write-Host $entry -ForegroundColor Red }
-        default   { Write-Host $entry }
+        "WARNING" { Write-Host $Entry -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $Entry -ForegroundColor Red }
+        default   { Write-Host $Entry }
     }
-}
-
-function ConvertTo-HttpStatusCode {
-    param([Parameter(Mandatory)]$Value)
-    try { return [int]$Value } catch {}
-    if ($null -ne $Value -and $Value.PSObject.Properties.Name -contains "value__") {
-        try { return [int]$Value.value__ } catch {}
-    }
-    return $null
-}
-
-function Get-ExceptionHttpStatusCode {
-    param([Parameter(Mandatory)][System.Exception]$Exception)
-    $current = $Exception
-    while ($null -ne $current) {
-        if ($current.PSObject.Properties.Name -contains "StatusCode" -and $null -ne $current.StatusCode) {
-            $code = ConvertTo-HttpStatusCode $current.StatusCode
-            if ($null -ne $code) { return $code }
-        }
-        if ($current.PSObject.Properties.Name -contains "Response" -and $null -ne $current.Response -and
-            $current.Response.PSObject.Properties.Name -contains "StatusCode") {
-            $code = ConvertTo-HttpStatusCode $current.Response.StatusCode
-            if ($null -ne $code) { return $code }
-        }
-        $current = $current.InnerException
-    }
-    $message = $Exception.ToString()
-    if ($message -match '(?i)\b401\b|Unauthorized') { return 401 }
-    if ($message -match '(?i)\b403\b|Forbidden|AccessDenied') { return 403 }
-    if ($message -match '(?i)\b404\b|SecretNotFound|not found') { return 404 }
-    return $null
 }
 
 function Connect-AzureManagedIdentityWithRetry {
-    param([int]$MaximumAttempts = 10, [int]$DelaySeconds = 15)
-    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 20)]
+        [int]$MaximumAttempts = 10,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 300)]
+        [int]$DelaySeconds = 15
+    )
+
+    for ($Attempt = 1; $Attempt -le $MaximumAttempts; $Attempt++) {
         try {
-            Write-Log "Managed-identity authentication attempt $attempt of $MaximumAttempts."
+            Write-Log ("Managed-identity authentication attempt {0} of {1}." -f $Attempt, $MaximumAttempts)
             Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
             $script:AzureConnected = $true
             return
-        } catch {
-            if ($attempt -eq $MaximumAttempts) { throw }
-            Write-Log "Managed-identity authentication failed: $($_.Exception.Message)" -Level WARNING
+        }
+        catch {
+            if ($Attempt -eq $MaximumAttempts) {
+                throw
+            }
+
+            Write-Log ("Managed-identity authentication failed: {0}" -f $_.Exception.Message) -Level "WARNING"
             Start-Sleep -Seconds $DelaySeconds
         }
     }
 }
 
 function Get-SecureRandomIndex {
-    param(
-        [Parameter(Mandatory)][ValidateRange(1,255)][int]$MaximumExclusive,
-        [Parameter(Mandatory)][System.Security.Cryptography.RandomNumberGenerator]$RandomNumberGenerator
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, 255)]
+        [int]$MaximumExclusive,
+
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.RandomNumberGenerator]$RandomNumberGenerator
     )
-    $b = New-Object byte[] 1
-    $upperBound = 256 - (256 % $MaximumExclusive)
+
+    $RandomByte = New-Object -TypeName byte[] -ArgumentList 1
+    $UpperBound = 256 - (256 % $MaximumExclusive)
+
     do {
-        $RandomNumberGenerator.GetBytes($b)
-        $value = [int]$b[0]
-    } while ($value -ge $upperBound)
-    return $value % $MaximumExclusive
+        $RandomNumberGenerator.GetBytes($RandomByte)
+        $Value = [int]$RandomByte[0]
+    }
+    while ($Value -ge $UpperBound)
+
+    return $Value % $MaximumExclusive
 }
 
 function New-EnrollmentPassword {
-    param([ValidateRange(32,128)][int]$Length = 64)
-    $upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
-    $lower = "abcdefghijkmnopqrstuvwxyz"
-    $nums  = "23456789"
-    $spec  = "!#%+,-.:=@_"
-    $all   = $upper + $lower + $nums + $spec
-    $chars = New-Object System.Collections.Generic.List[char]
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try {
-        foreach ($set in @($upper,$lower,$nums,$spec)) {
-            $chars.Add($set[(Get-SecureRandomIndex -MaximumExclusive $set.Length -RandomNumberGenerator $rng)])
-        }
-        while ($chars.Count -lt $Length) {
-            $chars.Add($all[(Get-SecureRandomIndex -MaximumExclusive $all.Length -RandomNumberGenerator $rng)])
-        }
-        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
-            $j = Get-SecureRandomIndex -MaximumExclusive ($i + 1) -RandomNumberGenerator $rng
-            $tmp=$chars[$i]; $chars[$i]=$chars[$j]; $chars[$j]=$tmp
-        }
-        return -join $chars
-    } finally { $rng.Dispose() }
-}
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(32, 128)]
+        [int]$Length = 64
+    )
 
-function Get-EnrollmentSecretState {
-    param([Parameter(Mandatory)][string]$ComputerName)
+    $UppercaseCharacters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+    $LowercaseCharacters = "abcdefghijkmnopqrstuvwxyz"
+    $NumberCharacters    = "23456789"
+    $SpecialCharacters   = "!#%+,-.:=@_"
+    $AllCharacters = $UppercaseCharacters + $LowercaseCharacters + $NumberCharacters + $SpecialCharacters
+
+    $Characters = New-Object -TypeName "System.Collections.Generic.List[char]"
+    $RandomNumberGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+
     try {
-        $secret = Get-AzKeyVaultSecret -VaultName $script:VaultName -Name $ComputerName -ErrorAction Stop
-        return [pscustomobject]@{ Exists=$true; Secret=$secret }
-    } catch {
-        $code = Get-ExceptionHttpStatusCode $_.Exception
-        if ($code -eq 404) { return [pscustomobject]@{ Exists=$false; Secret=$null } }
-        if ($code -eq 401) { throw "Key Vault returned HTTP 401 for secret '$ComputerName'." }
-        if ($code -eq 403) { throw "Key Vault returned HTTP 403 for secret '$ComputerName'." }
-        throw "Unable to check Key Vault secret '$ComputerName': $($_.Exception.Message)"
+        foreach ($CharacterSet in @(
+            $UppercaseCharacters,
+            $LowercaseCharacters,
+            $NumberCharacters,
+            $SpecialCharacters
+        )) {
+            $Index = Get-SecureRandomIndex -MaximumExclusive $CharacterSet.Length -RandomNumberGenerator $RandomNumberGenerator
+            $Characters.Add($CharacterSet[$Index])
+        }
+
+        while ($Characters.Count -lt $Length) {
+            $Index = Get-SecureRandomIndex -MaximumExclusive $AllCharacters.Length -RandomNumberGenerator $RandomNumberGenerator
+            $Characters.Add($AllCharacters[$Index])
+        }
+
+        for ($CurrentIndex = $Characters.Count - 1; $CurrentIndex -gt 0; $CurrentIndex--) {
+            $SwapIndex = Get-SecureRandomIndex -MaximumExclusive ($CurrentIndex + 1) -RandomNumberGenerator $RandomNumberGenerator
+            $TemporaryCharacter = $Characters[$CurrentIndex]
+            $Characters[$CurrentIndex] = $Characters[$SwapIndex]
+            $Characters[$SwapIndex] = $TemporaryCharacter
+        }
+
+        return -join $Characters
+    }
+    finally {
+        if ($null -ne $RandomNumberGenerator) {
+            $RandomNumberGenerator.Dispose()
+        }
     }
 }
 
 function Get-OrCreateComputerOU {
-    param([Parameter(Mandatory)][string]$DistinguishedName)
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DistinguishedName
+    )
+
     Write-Log "Checking target OU '$DistinguishedName'."
-    try {
-        return Get-ADOrganizationalUnit -Identity $DistinguishedName -Properties ProtectedFromAccidentalDeletion -ErrorAction Stop
-    } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
-        # expected when absent
+
+    $EscapedDistinguishedName = $DistinguishedName.Replace("'", "''")
+    $ExistingOUs = @(
+        Get-ADOrganizationalUnit `
+            -Filter "DistinguishedName -eq '$EscapedDistinguishedName'" `
+            -Properties ProtectedFromAccidentalDeletion `
+            -ErrorAction Stop
+    )
+
+    if ($ExistingOUs.Count -gt 1) {
+        throw "Multiple organizational units were returned for '$DistinguishedName'."
+    }
+
+    if ($ExistingOUs.Count -eq 1) {
+        Write-Log ("Target OU already exists: {0}" -f $ExistingOUs[0].DistinguishedName)
+        return $ExistingOUs[0]
     }
 
     if ($DistinguishedName -notmatch '^OU=([^,]+),(.+)$') {
-        throw "Unsupported OU distinguished name: '$DistinguishedName'."
+        throw "Unsupported OU distinguished name '$DistinguishedName'."
     }
-    $ouName=$Matches[1]; $parentDN=$Matches[2]
-    if ([string]::IsNullOrWhiteSpace($ouName) -or [string]::IsNullOrWhiteSpace($parentDN)) {
-        throw "Unable to parse OU name or parent DN from '$DistinguishedName'."
-    }
-    Get-ADObject -Identity $parentDN -ErrorAction Stop | Out-Null
 
-    $concurrent = Get-ADOrganizationalUnit -Identity $DistinguishedName -ErrorAction SilentlyContinue
-    if ($null -ne $concurrent) { return $concurrent }
+    $OUName = $Matches[1]
+    $ParentDN = $Matches[2]
+
+    if ([string]::IsNullOrWhiteSpace($OUName)) {
+        throw "The OU name parsed from '$DistinguishedName' is empty."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ParentDN)) {
+        throw "The parent DN parsed from '$DistinguishedName' is empty."
+    }
 
     try {
-        $created = New-ADOrganizationalUnit -Name $ouName -Path $parentDN `
-            -Description "Organizational unit for Linux computer accounts" `
-            -ProtectedFromAccidentalDeletion $true -PassThru -ErrorAction Stop
-    } catch {
-        $created = Get-ADOrganizationalUnit -Identity $DistinguishedName -ErrorAction SilentlyContinue
-        if ($null -eq $created) { throw }
+        Get-ADObject -Identity $ParentDN -ErrorAction Stop | Out-Null
     }
-    if ($created.DistinguishedName -ne $DistinguishedName) {
-        throw "OU verification failed. Expected '$DistinguishedName'; got '$($created.DistinguishedName)'."
+    catch {
+        throw ("The OU parent '{0}' does not exist or cannot be accessed: {1}" -f $ParentDN, $_.Exception.Message)
     }
-    Write-Log "OU ready: $($created.DistinguishedName)"
-    return $created
+
+    Write-Log ("Creating OU '{0}' under '{1}'." -f $OUName, $ParentDN)
+
+    $NewOUParameters = @{
+        Name                            = $OUName
+        Path                            = $ParentDN
+        Description                     = "Organizational unit for Linux computer accounts"
+        ProtectedFromAccidentalDeletion = $true
+        PassThru                        = $true
+        ErrorAction                     = "Stop"
+    }
+
+    $CreatedOU = New-ADOrganizationalUnit @NewOUParameters
+
+    if ($null -eq $CreatedOU) {
+        throw "New-ADOrganizationalUnit returned no object for '$DistinguishedName'."
+    }
+
+    Write-Log ("Created target OU: {0}" -f $CreatedOU.DistinguishedName)
+    return $CreatedOU
 }
 
 function New-ComputerEnrollmentPair {
-    param([Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9-]{1,15}$')][string]$ComputerName)
-    $name=$ComputerName.ToUpperInvariant()
-    $sam="{0}$" -f $name
-    $createdByThisRun=$false
-    $plain=$null; $secure=$null
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [ValidatePattern('^[A-Za-z0-9-]{1,15}$')]
+        [string]$ComputerName
+    )
+
+    $NormalizedComputerName = $ComputerName.Trim().ToUpperInvariant()
+    $ComputerSamAccountName = "{0}$" -f $NormalizedComputerName
+    $SecretName = $NormalizedComputerName
+
+    $ComputerCreatedByThisOperation = $false
+    $CreatedComputer = $null
+    $VerifiedComputer = $null
+    $EnrollmentPasswordPlainText = $null
+    $EnrollmentPassword = $null
+
     try {
-        $escaped=$sam.Replace("'","''")
-        $computers=@(Get-ADComputer -Filter "SamAccountName -eq '$escaped'" -Properties DistinguishedName,Enabled -ErrorAction Stop)
-        if ($computers.Count -gt 1) { throw "Multiple AD computers found for '$sam'." }
-        $computer=$computers | Select-Object -First 1
-        $secretState=Get-EnrollmentSecretState -ComputerName $name
-        $computerExists=$null -ne $computer
-        $secretExists=$secretState.Exists
+        Write-Log ("Checking Active Directory for computer '{0}'." -f $ComputerSamAccountName)
 
-        if ($computerExists -and $secretExists) {
-            Write-Log "$name already provisioned; no changes." -Level WARNING
-            return [pscustomobject]@{ ComputerName=$name; State='AlreadyProvisioned'; ADObject=$computer.DistinguishedName; SecretName=$name; Error=$null }
-        }
-        if ($computerExists -xor $secretExists) {
-            throw "Fail-safe stop for '$name': AD computer and Key Vault secret are in a partial state."
+        $EscapedSamAccountName = $ComputerSamAccountName.Replace("'", "''")
+        $MatchingComputers = @(
+            Get-ADComputer `
+                -Filter "SamAccountName -eq '$EscapedSamAccountName'" `
+                -Properties DistinguishedName, Enabled, SamAccountName `
+                -ErrorAction Stop
+        )
+
+        if ($MatchingComputers.Count -gt 1) {
+            throw "Multiple AD computers were returned for sAMAccountName '$ComputerSamAccountName'."
         }
 
-        $plain=New-EnrollmentPassword -Length $script:PasswordLength
-        $secure=ConvertTo-SecureString -String $plain -AsPlainText -Force
-        $created=New-ADComputer -Name $name -SamAccountName $sam -AccountPassword $secure `
-            -Path $script:ComputerOU -Enabled $true -Description "Prestaged Linux computer enrollment account" `
-            -PassThru -ErrorAction Stop
-        $createdByThisRun=$true
+        if ($MatchingComputers.Count -eq 1) {
+            Write-Log ("Computer '{0}' already exists as '{1}'. Skipping it." -f $ComputerSamAccountName, $MatchingComputers[0].DistinguishedName) -Level "WARNING"
 
-        $verified=Get-ADComputer -Identity $created.DistinguishedName -Properties Enabled,SamAccountName -ErrorAction Stop
-        if ($verified.SamAccountName -ne $sam -or -not $verified.Enabled) { throw "AD verification failed for '$name'." }
-
-        if ((Get-EnrollmentSecretState -ComputerName $name).Exists) {
-            throw "Secret '$name' appeared during provisioning; refusing overwrite."
-        }
-        $tags=@{ ComputerName=$name; SamAccountName=$sam; ComputerObjectDN=$created.DistinguishedName; Purpose='Linux-AD-Enrollment'; ProvisioningState='Pending-Consumption' }
-        $createdSecret=Set-AzKeyVaultSecret -VaultName $script:VaultName -Name $name -SecretValue $secure `
-            -ContentType "Linux Active Directory enrollment password" -Tag $tags -ErrorAction Stop
-        if ($null -eq $createdSecret -or [string]::IsNullOrWhiteSpace($createdSecret.Id)) {
-            throw "Key Vault returned no verifiable secret ID for '$name'."
-        }
-        $createdByThisRun=$false
-        Write-Log "$name provisioned successfully."
-        return [pscustomobject]@{ ComputerName=$name; State='Provisioned'; ADObject=$verified.DistinguishedName; SecretName=$createdSecret.Name; Error=$null }
-    } catch {
-        $original=$_.Exception
-        Write-Log "Provisioning failed for '$name': $($original.Message)" -Level ERROR
-        if ($createdByThisRun) {
-            try {
-                $rollback=Get-ADComputer -Identity $sam -ErrorAction Stop
-                Remove-ADComputer -Identity $rollback -Confirm:$false -ErrorAction Stop
-                Write-Log "Rollback succeeded for '$sam'." -Level WARNING
-            } catch {
-                return [pscustomobject]@{ ComputerName=$name; State='RollbackFailed'; ADObject=$null; SecretName=$name; Error="Provisioning: $($original.Message); rollback: $($_.Exception.Message)" }
+            return [pscustomobject]@{
+                ComputerName = $NormalizedComputerName
+                State        = "SkippedExisting"
+                ADObject     = $MatchingComputers[0].DistinguishedName
+                SecretName   = $null
+                Error        = $null
             }
         }
-        return [pscustomobject]@{ ComputerName=$name; State='Failed'; ADObject=$null; SecretName=$name; Error=$original.Message }
-    } finally {
-        $plain=$null; $secure=$null
+
+        Write-Log ("Computer '{0}' does not exist. Generating its enrollment password." -f $ComputerSamAccountName)
+
+        $EnrollmentPasswordPlainText = New-EnrollmentPassword -Length $script:PasswordLength
+        $EnrollmentPassword = ConvertTo-SecureString -String $EnrollmentPasswordPlainText -AsPlainText -Force
+
+        $ConcurrentMatches = @(
+            Get-ADComputer `
+                -Filter "SamAccountName -eq '$EscapedSamAccountName'" `
+                -Properties DistinguishedName `
+                -ErrorAction Stop
+        )
+
+        if ($ConcurrentMatches.Count -gt 0) {
+            Write-Log ("Computer '{0}' appeared during provisioning. Skipping it." -f $ComputerSamAccountName) -Level "WARNING"
+
+            return [pscustomobject]@{
+                ComputerName = $NormalizedComputerName
+                State        = "SkippedConcurrent"
+                ADObject     = $ConcurrentMatches[0].DistinguishedName
+                SecretName   = $null
+                Error        = $null
+            }
+        }
+
+        $NewComputerParameters = @{
+            Name            = $NormalizedComputerName
+            SamAccountName  = $ComputerSamAccountName
+            AccountPassword = $EnrollmentPassword
+            Path            = $script:ComputerOU
+            Enabled         = $true
+            Description     = "Prestaged Linux computer enrollment account"
+            PassThru        = $true
+            ErrorAction     = "Stop"
+        }
+
+        Write-Log ("Creating AD computer '{0}' in '{1}'." -f $ComputerSamAccountName, $script:ComputerOU)
+        $CreatedComputer = New-ADComputer @NewComputerParameters
+        $ComputerCreatedByThisOperation = $true
+
+        if ($null -eq $CreatedComputer) {
+            throw "New-ADComputer returned no object for '$NormalizedComputerName'."
+        }
+
+        $VerifiedComputer = Get-ADComputer `
+            -Identity $CreatedComputer.DistinguishedName `
+            -Properties DistinguishedName, Enabled, SamAccountName `
+            -ErrorAction Stop
+
+        if ($VerifiedComputer.SamAccountName -ne $ComputerSamAccountName) {
+            throw ("AD verification failed for '{0}': expected sAMAccountName '{1}', received '{2}'." -f $NormalizedComputerName, $ComputerSamAccountName, $VerifiedComputer.SamAccountName)
+        }
+
+        if (-not $VerifiedComputer.Enabled) {
+            throw "AD verification failed for '$NormalizedComputerName': the computer account is disabled."
+        }
+
+        $SecretTags = @{
+            ComputerName      = $NormalizedComputerName
+            SamAccountName    = $ComputerSamAccountName
+            ComputerObjectDN  = $VerifiedComputer.DistinguishedName
+            Purpose           = "Linux-AD-Enrollment"
+            ProvisioningState = "Pending-Consumption"
+        }
+
+        $SecretParameters = @{
+            VaultName   = $script:VaultName
+            Name        = $SecretName
+            SecretValue = $EnrollmentPassword
+            ContentType = "Linux Active Directory enrollment password"
+            Tag         = $SecretTags
+            ErrorAction = "Stop"
+        }
+
+        Write-Log ("Storing enrollment password as Key Vault secret '{0}'." -f $SecretName)
+        $CreatedSecret = Set-AzKeyVaultSecret @SecretParameters
+
+        if ($null -eq $CreatedSecret -or [string]::IsNullOrWhiteSpace($CreatedSecret.Id)) {
+            throw "Key Vault did not return a valid secret ID for '$SecretName'."
+        }
+
+        $ComputerCreatedByThisOperation = $false
+
+        Write-Log ("Computer '{0}' and Key Vault secret '{1}' were created successfully." -f $ComputerSamAccountName, $CreatedSecret.Name)
+
+        return [pscustomobject]@{
+            ComputerName = $NormalizedComputerName
+            State        = "Provisioned"
+            ADObject     = $VerifiedComputer.DistinguishedName
+            SecretName   = $CreatedSecret.Name
+            Error        = $null
+        }
+    }
+    catch {
+        $OriginalError = $_.Exception
+
+        Write-Log ("Provisioning failed for '{0}': {1}" -f $NormalizedComputerName, $OriginalError.Message) -Level "ERROR"
+
+        if ($ComputerCreatedByThisOperation -and $null -ne $CreatedComputer) {
+            Write-Log ("Removing newly created AD computer '{0}' because provisioning did not complete." -f $ComputerSamAccountName) -Level "WARNING"
+
+            try {
+                Remove-ADComputer `
+                    -Identity $CreatedComputer.DistinguishedName `
+                    -Confirm:$false `
+                    -ErrorAction Stop
+
+                Write-Log ("Rollback succeeded for '{0}'." -f $ComputerSamAccountName) -Level "WARNING"
+            }
+            catch {
+                $RollbackError = $_.Exception.Message
+
+                Write-Log ("Rollback failed for '{0}': {1}" -f $ComputerSamAccountName, $RollbackError) -Level "ERROR"
+
+                return [pscustomobject]@{
+                    ComputerName = $NormalizedComputerName
+                    State        = "RollbackFailed"
+                    ADObject     = $CreatedComputer.DistinguishedName
+                    SecretName   = $SecretName
+                    Error        = "Provisioning error: {0}; rollback error: {1}" -f $OriginalError.Message, $RollbackError
+                }
+            }
+        }
+
+        return [pscustomobject]@{
+            ComputerName = $NormalizedComputerName
+            State        = "Failed"
+            ADObject     = $null
+            SecretName   = $SecretName
+            Error        = $OriginalError.Message
+        }
+    }
+    finally {
+        $EnrollmentPasswordPlainText = $null
+        $EnrollmentPassword = $null
     }
 }
 
-$logDir=Split-Path -Path $LogFile -Parent
-if (-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path -LiteralPath $logDir)) {
-    New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+$LogDirectory = Split-Path -Path $LogFile -Parent
+
+if (-not [string]::IsNullOrWhiteSpace($LogDirectory) -and -not (Test-Path -LiteralPath $LogDirectory)) {
+    New-Item -ItemType Directory -Path $LogDirectory -Force -ErrorAction Stop | Out-Null
 }
 
 Write-Log "Starting Linux computer enrollment provisioning."
+
 try {
-    $ComputerNames=@($ComputerNamesJson | ConvertFrom-Json -ErrorAction Stop)
+    $ParsedComputerNames = ConvertFrom-Json -InputObject $ComputerNamesJson -ErrorAction Stop
+
+    $ComputerNames = @(
+        foreach ($ComputerName in $ParsedComputerNames) {
+            $ComputerName
+        }
+    )
+
     if ($ComputerNames.Count -eq 0) {
-        Write-Log "No computer names supplied; no changes required." -Level WARNING
+        Write-Log "No computer names were supplied. No changes are required." -Level "WARNING"
         return
     }
 
-    $normalized=@(foreach ($computer in $ComputerNames) {
-        if ($null -eq $computer) { throw "Computer-name array contains null." }
-        $n=([string]$computer).Trim().ToUpperInvariant()
-        if ($n -notmatch '^[A-Z0-9-]{1,15}$') { throw "Invalid computer name '$computer'." }
-        $n
-    })
-    $duplicates=@($normalized | Group-Object | Where-Object Count -gt 1 | Select-Object -ExpandProperty Name)
-    if ($duplicates.Count -gt 0) { throw "Duplicate computer names: $($duplicates -join ', ')" }
+    $NormalizedComputerNames = @(
+        foreach ($ComputerName in $ComputerNames) {
+            if ($null -eq $ComputerName) {
+                throw "The computer-name array contains a null value."
+            }
+
+            $NormalizedName = ([string]$ComputerName).Trim().ToUpperInvariant()
+
+            if ($NormalizedName -notmatch '^[A-Z0-9-]{1,15}$') {
+                throw "Invalid computer name '$ComputerName'. Names must contain 1 through 15 letters, numbers, or hyphens."
+            }
+
+            $NormalizedName
+        }
+    )
+
+    $DuplicateComputerNames = @(
+        $NormalizedComputerNames |
+            Group-Object |
+            Where-Object { $_.Count -gt 1 } |
+            Select-Object -ExpandProperty Name
+    )
+
+    if ($DuplicateComputerNames.Count -gt 0) {
+        throw ("Duplicate computer names were supplied: {0}" -f ($DuplicateComputerNames -join ", "))
+    }
 
     Import-Module ActiveDirectory -ErrorAction Stop
     Import-Module Az.Accounts -ErrorAction Stop
     Import-Module Az.KeyVault -ErrorAction Stop
 
-    $targetOU=Get-OrCreateComputerOU -DistinguishedName $ComputerOU
-    if ($null -eq $targetOU) { throw "Target OU could not be found or created: $ComputerOU" }
-    $ComputerOU=$targetOU.DistinguishedName
+    $TargetOU = Get-OrCreateComputerOU -DistinguishedName $ComputerOU
+
+    if ($null -eq $TargetOU) {
+        throw "The target OU could not be found or created: $ComputerOU"
+    }
+
+    $ComputerOU = $TargetOU.DistinguishedName
 
     Disable-AzContextAutosave -Scope Process -ErrorAction Stop | Out-Null
     Clear-AzContext -Scope Process -Force -ErrorAction SilentlyContinue
+
     Connect-AzureManagedIdentityWithRetry
+
     if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
         Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
     }
 
-    $Results=@(foreach ($computer in $normalized) { New-ComputerEnrollmentPair -ComputerName $computer })
-    $failed=@($Results | Where-Object State -in @('Failed','RollbackFailed'))
-    foreach ($result in $Results) {
-        Write-Host ("{0}: {1}" -f $result.ComputerName,$result.State)
-        if (-not [string]::IsNullOrWhiteSpace($result.Error)) { Write-Host "  Error: $($result.Error)" -ForegroundColor Red }
+    $Results = @(
+        foreach ($ComputerName in $NormalizedComputerNames) {
+            Write-Log "Processing computer '$ComputerName'."
+            New-ComputerEnrollmentPair -ComputerName $ComputerName
+        }
+    )
+
+    $FailedResults = @(
+        $Results |
+            Where-Object { $_.State -in @("Failed", "RollbackFailed") }
+    )
+
+    Write-Host ""
+    Write-Host "Linux computer enrollment results"
+    Write-Host "================================="
+    Write-Host ""
+
+    foreach ($Result in $Results) {
+        Write-Host ("{0}: {1}" -f $Result.ComputerName, $Result.State)
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$Result.ADObject)) {
+            Write-Host "  AD object: $($Result.ADObject)"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$Result.SecretName)) {
+            Write-Host "  Secret:    $($Result.SecretName)"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$Result.Error)) {
+            Write-Host "  Error:     $($Result.Error)" -ForegroundColor Red
+        }
     }
-    if ($failed.Count -gt 0) { throw "$($failed.Count) computer enrollment operation(s) failed. Review '$LogFile'." }
-    Write-Log "All computer enrollment operations completed successfully."
-} catch {
-    Write-Log "Batch provisioning failed: $($_.Exception.Message)" -Level ERROR
+
+    if ($FailedResults.Count -gt 0) {
+        throw ("{0} computer enrollment operation(s) failed. Review '{1}'." -f $FailedResults.Count, $LogFile)
+    }
+
+    Write-Log "Linux computer enrollment completed successfully."
+}
+catch {
+    Write-Log ("Batch provisioning failed: {0}" -f $_.Exception.Message) -Level "ERROR"
     throw
-} finally {
+}
+finally {
     if ($AzureConnected) {
         Disconnect-AzAccount -Scope Process -ErrorAction SilentlyContinue | Out-Null
         Clear-AzContext -Scope Process -Force -ErrorAction SilentlyContinue
     }
+
     Write-Log "Script execution ended."
 }

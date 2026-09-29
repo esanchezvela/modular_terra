@@ -116,7 +116,7 @@ function Get-DsrmPasswordWithRetry {
     )
 
     $secretName = [Uri]::EscapeDataString($script:DsrmSecretName)
-    $secretUri = "https://$($script:DsrmVaultName).vault.azure.net/secrets/$secretName?api-version=7.4"
+    $secretUri = "https://$($script:DsrmVaultName).vault.azure.net/secrets/$($secretName)?api-version=7.4"
 
     for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
         try {
@@ -139,6 +139,190 @@ function Get-DsrmPasswordWithRetry {
             Write-BootstrapLog -Message "DSRM secret retrieval failed: $($_.Exception.Message)" -Level "WARNING"
             Start-Sleep -Seconds $DelaySeconds
         }
+    }
+}
+
+
+function Install-EnrollmentPrerequisites {
+    [CmdletBinding()]
+    param ()
+
+    $requiredModules = @(
+        "Az.Accounts",
+        "Az.KeyVault"
+    )
+
+    $minimumPackageModules = @(
+        @{
+            Name           = "PackageManagement"
+            MinimumVersion = [version]"1.4.8.1"
+        },
+        @{
+            Name           = "PowerShellGet"
+            MinimumVersion = [version]"2.2.5"
+        }
+    )
+
+    $originalConfirmPreference = $ConfirmPreference
+    $ConfirmPreference = "None"
+
+    try {
+        # PowerShell Gallery requires TLS 1.2 or later. Preserve any protocols
+        # already enabled in the current Windows PowerShell process.
+        if (([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType]::Tls12) -eq 0) {
+            [Net.ServicePointManager]::SecurityProtocol =
+                [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        }
+
+        # Windows PowerShell 5.1 commonly needs the NuGet provider bootstrapped
+        # before Install-Module can resolve modules and their dependencies.
+        $nuGetProvider = Get-PackageProvider `
+            -Name "NuGet" `
+            -ListAvailable `
+            -ErrorAction SilentlyContinue |
+            Sort-Object -Property Version -Descending |
+            Select-Object -First 1
+
+        if (($null -eq $nuGetProvider) -or
+            ($nuGetProvider.Version -lt [version]"2.8.5.201")) {
+            Write-BootstrapLog -Message "Installing or updating the NuGet package provider."
+
+            Install-PackageProvider `
+                -Name "NuGet" `
+                -MinimumVersion "2.8.5.201" `
+                -Scope AllUsers `
+                -Force `
+                -Confirm:$false `
+                -ErrorAction Stop | Out-Null
+        }
+
+        Import-PackageProvider `
+            -Name "NuGet" `
+            -MinimumVersion "2.8.5.201" `
+            -Force `
+            -ErrorAction Stop | Out-Null
+
+        $gallery = Get-PSRepository -Name "PSGallery" -ErrorAction SilentlyContinue
+        if ($null -eq $gallery) {
+            Write-BootstrapLog -Message "Registering the default PowerShell Gallery repository."
+            Register-PSRepository -Default -ErrorAction Stop
+            $gallery = Get-PSRepository -Name "PSGallery" -ErrorAction Stop
+        }
+
+        if ($gallery.InstallationPolicy -ne "Trusted") {
+            Write-BootstrapLog -Message "Configuring PSGallery as a trusted repository."
+            Set-PSRepository `
+                -Name "PSGallery" `
+                -InstallationPolicy Trusted `
+                -ErrorAction Stop
+        }
+
+        # Upgrade the Windows PowerShell package-management components when the
+        # inbox versions are older. The newer versions are installed side by
+        # side and will be used by subsequent PowerShell processes.
+        foreach ($packageModule in $minimumPackageModules) {
+            $installedPackageModule = Get-Module `
+                -Name $packageModule.Name `
+                -ListAvailable `
+                -ErrorAction SilentlyContinue |
+                Sort-Object -Property Version -Descending |
+                Select-Object -First 1
+
+            if (($null -eq $installedPackageModule) -or
+                ($installedPackageModule.Version -lt $packageModule.MinimumVersion)) {
+                Write-BootstrapLog -Message (
+                    "Installing or updating PowerShell package module '{0}' to at least version {1}." -f
+                    $packageModule.Name,
+                    $packageModule.MinimumVersion
+                )
+
+                Install-Module `
+                    -Name $packageModule.Name `
+                    -MinimumVersion ([string]$packageModule.MinimumVersion) `
+                    -Repository "PSGallery" `
+                    -Scope AllUsers `
+                    -Force `
+                    -AllowClobber `
+                    -Confirm:$false `
+                    -ErrorAction Stop
+            }
+
+            $installedPackageModule = Get-Module `
+                -Name $packageModule.Name `
+                -ListAvailable `
+                -ErrorAction Stop |
+                Sort-Object -Property Version -Descending |
+                Select-Object -First 1
+
+            if (($null -eq $installedPackageModule) -or
+                ($installedPackageModule.Version -lt $packageModule.MinimumVersion)) {
+                throw (
+                    "PowerShell package module '{0}' version {1} or later is required." -f
+                    $packageModule.Name,
+                    $packageModule.MinimumVersion
+                )
+            }
+
+            Write-BootstrapLog -Message (
+                "PowerShell package module '{0}' version {1} is available." -f
+                $packageModule.Name,
+                $installedPackageModule.Version
+            ) -Level "SUCCESS"
+        }
+
+        foreach ($moduleName in $requiredModules) {
+            $installedModule = Get-Module `
+                -Name $moduleName `
+                -ListAvailable `
+                -ErrorAction SilentlyContinue |
+                Sort-Object -Property Version -Descending |
+                Select-Object -First 1
+
+            if ($null -eq $installedModule) {
+                Write-BootstrapLog -Message (
+                    "Installing required PowerShell module '{0}' and its declared dependencies." -f
+                    $moduleName
+                )
+
+                Install-Module `
+                    -Name $moduleName `
+                    -Repository "PSGallery" `
+                    -Scope AllUsers `
+                    -Force `
+                    -AllowClobber `
+                    -Confirm:$false `
+                    -ErrorAction Stop
+            }
+
+            $installedModule = Get-Module `
+                -Name $moduleName `
+                -ListAvailable `
+                -ErrorAction Stop |
+                Sort-Object -Property Version -Descending |
+                Select-Object -First 1
+
+            if ($null -eq $installedModule) {
+                throw "PowerShell module '$moduleName' was not found after installation."
+            }
+
+            Import-Module `
+                -Name $moduleName `
+                -Force `
+                -ErrorAction Stop
+
+            Write-BootstrapLog -Message (
+                "PowerShell module '{0}' version {1} is installed and importable." -f
+                $moduleName,
+                $installedModule.Version
+            ) -Level "SUCCESS"
+        }
+
+        Write-BootstrapLog -Message (
+            "Linux enrollment PowerShell prerequisites and dependencies are available."
+        ) -Level "SUCCESS"
+    }
+    finally {
+        $ConfirmPreference = $originalConfirmPreference
     }
 }
 
@@ -244,6 +428,11 @@ try {
     Copy-Item -LiteralPath $DownloadedPostRebootScript -Destination $PostRebootScript -Force -ErrorAction Stop
     Copy-Item -LiteralPath $DownloadedEnrollmentScript -Destination $EnrollmentScript -Force -ErrorAction Stop
     Write-BootstrapLog -Message "Post-reboot scripts staged under '$ProvisioningRoot'." -Level "SUCCESS"
+
+    # LinuxComputerEnrollment.ps1 declares #Requires for Az.Accounts and
+    # Az.KeyVault. Install them before promotion so the SYSTEM continuation
+    # task can resolve the modules immediately after reboot.
+    Install-EnrollmentPrerequisites
 
     $feature = Get-WindowsFeature -Name AD-Domain-Services -ErrorAction Stop
     if (-not $feature.Installed) {

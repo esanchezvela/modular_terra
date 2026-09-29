@@ -12,3 +12,6 @@ packages:
   - nmap
 #  - samba-common-tools
 
+rumcmd:
+- python3 -m venv ~/.adlab
+- :

@@ -177,6 +177,31 @@ try {
         throw "Linux enrollment script was not found at '$EnrollmentScript'."
     }
 
+    $requiredModules = @(
+        "ActiveDirectory",
+        "Az.Accounts",
+        "Az.KeyVault"
+    )
+
+    foreach ($moduleName in $requiredModules) {
+        $module = Get-Module `
+            -Name $moduleName `
+            -ListAvailable `
+            -ErrorAction SilentlyContinue |
+            Sort-Object -Property Version -Descending |
+            Select-Object -First 1
+
+        if ($null -eq $module) {
+            throw "Required PowerShell module '$moduleName' is not available."
+        }
+
+        Write-PostRebootLog -Message (
+            "Required PowerShell module '{0}' version {1} verified." -f
+            $moduleName,
+            $module.Version
+        ) -Level "SUCCESS"
+    }
+
     Write-PostRebootLog -Message "Starting Linux computer enrollment script '$EnrollmentScript'."
 
     & $EnrollmentScript

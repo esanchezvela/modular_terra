@@ -14,7 +14,7 @@ locals {
   enrollment_script = templatefile(
     "${path.module}/scripts/LinuxComputerEnrollment.ps1.tftpl",
     {
-      COMPUTER_NAMES_JSON = jsonencode(jsonencode(local.computer_names))
+      COMPUTER_NAMES_JSON = jsonencode(local.computer_names)
       COMPUTER_OU         = jsonencode(var.computer_ou)
       KEY_VAULT_NAME      = jsonencode(azurerm_key_vault.domain_join.name)
       SUBSCRIPTION_ID     = jsonencode(data.azurerm_client_config.current.subscription_id)
