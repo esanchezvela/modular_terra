@@ -13,18 +13,258 @@ packages:
   - tcpdump
   - nmap
   - krb5-user
-
-#  - samba-common-tools
-
+  - python3-venv
+  - python3-pip
 
 write_files:
-  - path: /etc/netplan/99-dns.yaml
-    append: false
-    owner:  root:root
-    permissions: '0644'
+  - path: /opt/vm-deployment/deploy.py
+    owner: root:root
+    permissions: "0700"
     content: |
-      network:
-        ethernets:
-          eth0:
-            nameservers:
-              search: [ "contosoi.com" ]
+      #!/usr/bin/env python3
+      
+      import argparse
+      import logging
+      import os
+      import re
+      import socket
+      import sys
+      import time
+      import shutil
+      import subprocess
+      from logging.handlers import RotatingFileHandler
+      
+      from azure.core.exceptions import AzureError
+      from azure.identity import ManagedIdentityCredential
+      from azure.keyvault.secrets import SecretClient
+      
+      LOG_FILE = "/var/log/vm-deployment.log"
+      MAX_RETRIES = 10
+      RETRY_DELAY_SECONDS = 60
+      
+      LOGGER = logging.getLogger("vm-deployment")
+      
+      KEY_VAULT_NAME_PATTERN = re.compile(
+          r"^[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]$"
+      )
+      
+      def configure_logging() -> None:
+          log_formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+      
+          file_handler = RotatingFileHandler(
+              LOG_FILE,
+              maxBytes=5 * 1024 * 1024,
+              backupCount=3,
+              encoding="utf-8",
+          )
+          file_handler.setFormatter(log_formatter)
+      
+          # Azure VM Extension captures console output in its handler logs.
+          console_handler = logging.StreamHandler(sys.stderr)
+          console_handler.setFormatter(log_formatter)
+      
+          logging.basicConfig(
+              level=logging.INFO,
+              handlers=[
+                  file_handler,
+                  console_handler,
+              ],
+          )
+      
+          os.chmod(LOG_FILE, 0o640)
+      
+      def validate_key_vault_name(value: str) -> str:
+          value = value.strip()
+      
+          if not value:
+              raise argparse.ArgumentTypeError(
+                  "Key Vault name cannot be empty."
+              )
+      
+          if not KEY_VAULT_NAME_PATTERN.fullmatch(value):
+              raise argparse.ArgumentTypeError(
+                  "Key Vault name must be 3-24 characters, start with a letter, "
+                  "end with a letter or number, and contain only letters, numbers, "
+                  "and hyphens."
+              )
+      
+          if "--" in value:
+              raise argparse.ArgumentTypeError(
+                  "Key Vault name cannot contain consecutive hyphens."
+              )
+      
+          return value
+      
+      
+      def parse_arguments() -> argparse.Namespace:
+          parser = argparse.ArgumentParser(
+              description=(
+                  "Retrieve host-specific deployment configuration from "
+                  "Azure Key Vault."
+              )
+          )
+      
+          parser.add_argument("--vault",       required=True, type=validate_key_vault_name, help="Name of the Azure Key Vault where secrets are stored.",)
+          parser.add_argument("--computer_ou", required=True,   help="AD OU where server will join",)
+          parser.add_argument("--domain",      required=True,   help="AD Domain Name",)
+      
+          return parser.parse_args()
+      
+      def join_domain(
+          domain: str,
+          computer_ou: str,
+          domain_password: str,
+      ) -> None:
+          realm_command = shutil.which("realm")
+      
+          if not realm_command:
+              raise RuntimeError("The realm command is not installed.")
+      
+          command = [
+              realm_command,
+              "join",
+              "--computer-ou={0}".format(computer_ou),
+              "--one-time-password={0}".format(domain_password),
+              domain,
+          ]
+      
+          result = subprocess.run(
+              command,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              universal_newlines=True,
+          )
+      
+          if result.returncode != 0:
+              # Never log command because it contains the password.
+              error_message = result.stderr.strip() or result.stdout.strip()
+      
+              raise RuntimeError(
+                  "Domain join failed with exit code {0}: {1}".format(
+                      result.returncode,
+                      error_message,
+                  )
+              )
+      
+          LOGGER.info("Server joined domain %s successfully.", domain)
+      
+      def get_secret_with_retries(
+          client: SecretClient,
+          secret_name: str,
+      ) -> str:
+          total_attempts = MAX_RETRIES + 1
+      
+          for attempt in range(1, total_attempts + 1):
+              try:
+                  LOGGER.info(
+                      "Retrieving deployment configuration for host %s "
+                      "(attempt %d of %d).",
+                      secret_name,
+                      attempt,
+                      total_attempts,
+                  )
+      
+                  secret_value = client.get_secret(secret_name).value
+      
+                  if not secret_value:
+                      raise RuntimeError(
+                          f"Secret for host {secret_name!r} is empty."
+                      )
+      
+                  return secret_value
+      
+              except (AzureError, RuntimeError) as error:
+                  if attempt == total_attempts:
+                      LOGGER.error(
+                          "Unable to retrieve a valid deployment configuration "
+                          "after %d attempts.",
+                          total_attempts,
+                      )
+                      raise
+      
+                  LOGGER.warning(
+                      "Deployment configuration retrieval failed: %s. "
+                      "Retrying in %d seconds.",
+                      error,
+                      RETRY_DELAY_SECONDS,
+                  )
+      
+                  time.sleep(RETRY_DELAY_SECONDS)
+      
+          raise RuntimeError("Secret retrieval ended unexpectedly.")
+      
+      
+      def deploy(secret_value: str) -> None:
+          """
+          Perform the deployment using the retrieved secret.
+      
+          Do not print, log, or pass secret_value as a command-line argument.
+          """
+          if not secret_value:
+              raise RuntimeError("Deployment configuration is empty.")
+      
+          LOGGER.warning(secret_value)
+      
+          # Add the deployment implementation here.
+          LOGGER.info("Deployment operation completed successfully.")
+      
+      def main() -> int:
+          args = parse_arguments()
+          secret_name = socket.gethostname().split(".", maxsplit=1)[0]
+          secret_name = secret_name.upper()
+      
+          if not secret_name:
+              LOGGER.error("Unable to determine the server hostname.")
+              return 1
+      
+          LOGGER.info(
+              "Starting deployment for host %s using Key Vault %s.",
+              secret_name,
+              args.vault,
+          )
+      
+          credential = ManagedIdentityCredential()
+          client = SecretClient(
+              vault_url=f"https://{args.vault}.vault.azure.net",
+              credential=credential,
+          )
+      
+          try:
+              secret_value = get_secret_with_retries(client=client, secret_name=secret_name,)
+      
+              LOGGER.debug("Deployment configuration retrieved successfully for host %s.", secret_name,)
+              LOGGER.debug("Argument info vault: %s.", args.vault,)
+              LOGGER.debug("Argument info computer-ou: %s.", args.computer_ou,)
+              LOGGER.debug("Argument info domain: %s.", args.domain,)
+      
+              join_domain(domain=args.domain, computer_ou=args.computer_ou, domain_password=secret_value)
+      
+          except AzureError:
+              LOGGER.exception("Key Vault operation failed permanently for host %s.", secret_name,)
+              return 1
+      
+          except RuntimeError:
+              LOGGER.exception("Deployment configuration is invalid for host %s.", secret_name,)
+              return 1
+      
+          except Exception:
+              LOGGER.exception("An unexpected deployment error occurred for host %s.", secret_name,)
+              return 1
+      
+          finally:
+              client.close()
+              credential.close()
+      
+      if __name__ == "__main__":
+          try:
+              configure_logging()
+          except PermissionError:
+              print(f"Unable to open {LOG_FILE}. Run this script as root.", file=sys.stderr,)
+              sys.exit(1)
+      
+          sys.exit(main())
+
+runcmd:
+- python3 -m venv /opt/vm-deployment/venv
+- /opt/vm-deployment/venv/bin/python -m pip install --upgrade pip
+- /opt/vm-deployment/venv/bin/python -m pip install azure-identity==1.10.0 azure-keyvault-secrets==4.6.0

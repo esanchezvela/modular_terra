@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 <#
@@ -7,8 +7,9 @@
 
 .DESCRIPTION
     Runs under the Azure Windows Custom Script Extension. It stages the
-    post-reboot scripts, retrieves the DSRM password from Azure Key Vault by
-    using the VM system-assigned managed identity, installs AD DS, validates
+    post-reboot scripts, generates the DSRM password locally, stores it in
+    Azure Key Vault by using the VM system-assigned managed identity, installs
+    AD DS, validates
     the new forest configuration, promotes the server to the first writable
     domain controller with DNS, registers the post-reboot continuation task,
     and schedules a controlled reboot after the extension can return success.
@@ -34,10 +35,13 @@ $BootstrapLog     = Join-Path -Path $ProvisioningRoot -ChildPath "Bootstrap.log"
 $Phase1Marker     = Join-Path -Path $ProvisioningRoot -ChildPath "ADDS-Phase1-Complete.txt"
 $FailureMarker    = Join-Path -Path $ProvisioningRoot -ChildPath "ADDS-Phase1-Failed.txt"
 
-$DownloadedPostRebootScript = Join-Path -Path $PSScriptRoot -ChildPath "Complete-LinuxEnrollment.ps1"
-$DownloadedEnrollmentScript = Join-Path -Path $PSScriptRoot -ChildPath "LinuxComputerEnrollment.ps1"
-$PostRebootScript = Join-Path -Path $ProvisioningRoot -ChildPath "Complete-LinuxEnrollment.ps1"
-$EnrollmentScript = Join-Path -Path $ProvisioningRoot -ChildPath "LinuxComputerEnrollment.ps1"
+$DownloadedPostRebootScript  = Join-Path -Path $PSScriptRoot -ChildPath "Complete-LinuxEnrollment.ps1"
+$DownloadedEnrollmentScript  = Join-Path -Path $PSScriptRoot -ChildPath "LinuxComputerEnrollment.ps1"
+$DownloadedReverseZoneScript = Join-Path -Path $PSScriptRoot -ChildPath "CreateReverseZone.ps1"
+
+$PostRebootScript   =  Join-Path -Path $ProvisioningRoot -ChildPath "Complete-LinuxEnrollment.ps1"
+$EnrollmentScript   =  Join-Path -Path $ProvisioningRoot -ChildPath "LinuxComputerEnrollment.ps1"
+$ReverseZoneScript  =  Join-Path -Path $ProvisioningRoot -ChildPath "CreateReverseZone.ps1"
 
 $PostRebootTaskName = "Complete-Linux-AD-Provisioning"
 $RebootTaskName     = "ADDS-Promotion-Reboot"
@@ -65,84 +69,104 @@ function Write-BootstrapLog {
     }
 }
 
-function Get-ManagedIdentityToken {
+function Put-DsrmPasswordWithRetry {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
+        [System.Security.SecureString]$Password,
+
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$Resource,
+        [string]$VaultName,
 
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SecretName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$NetbiosName,
+
+        [Parameter(Mandatory = $false)]
+        [string]$AzureSubscriptionId,
+
+        [Parameter(Mandatory = $false)]
         [ValidateRange(1, 20)]
         [int]$MaximumAttempts = 10,
 
-        [ValidateRange(1, 120)]
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 300)]
         [int]$DelaySeconds = 15
     )
 
-    $encodedResource = [Uri]::EscapeDataString($Resource)
-    $uri = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$encodedResource"
-    $headers = @{ Metadata = "true" }
+    $SecretTags = @{
+        DomainNetbiosName  = $NetbiosName
+        Purpose            = "AD-DS-DSRM"
+        ProvisioningState  = "Provisioned"
+    }
 
-    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+    for ($Attempt = 1; $Attempt -le $MaximumAttempts; $Attempt++) {
         try {
-            Write-BootstrapLog -Message "Managed identity token attempt $attempt of $MaximumAttempts."
-            $response = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -TimeoutSec 30 -ErrorAction Stop
+            Write-BootstrapLog -Message (
+                "Storing DSRM password as Key Vault secret '{0}' (attempt {1} of {2})." -f
+                $SecretName,
+                $Attempt,
+                $MaximumAttempts
+            )
 
-            if ([string]$response.access_token -eq "") {
-                throw "Managed identity endpoint returned an empty access token."
+            Disable-AzContextAutosave -Scope Process -ErrorAction Stop | Out-Null
+            Clear-AzContext -Scope Process -Force -ErrorAction SilentlyContinue
+            Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+
+            if (-not [string]::IsNullOrWhiteSpace($AzureSubscriptionId)) {
+                Set-AzContext -SubscriptionId $AzureSubscriptionId -ErrorAction Stop | Out-Null
             }
 
-            return [string]$response.access_token
+            $SecretParameters = @{
+                VaultName   = $VaultName
+                Name        = $SecretName
+                SecretValue = $Password
+                ContentType = "Active Directory DSRM password"
+                Tag         = $SecretTags
+                ErrorAction = "Stop"
+            }
+
+            $CreatedSecret = Set-AzKeyVaultSecret @SecretParameters
+
+            if (
+                $null -eq $CreatedSecret -or
+                [string]::IsNullOrWhiteSpace($CreatedSecret.Id)
+            ) {
+                throw ("Key Vault did not return a valid secret ID for '{0}'." -f $SecretName)
+            }
+
+            Write-BootstrapLog -Message (
+                "Successfully stored DSRM password as Key Vault secret '{0}'." -f
+                $SecretName
+            ) -Level "SUCCESS"
+
+            return $CreatedSecret
         }
         catch {
-            if ($attempt -eq $MaximumAttempts) {
-                throw
+            if ($Attempt -eq $MaximumAttempts) {
+                throw (
+                    "Unable to store DSRM password in Key Vault after {0} attempt(s): {1}" -f
+                    $MaximumAttempts,
+                    $_.Exception.Message
+                )
             }
 
-            Write-BootstrapLog -Message "Managed identity token request failed: $($_.Exception.Message)" -Level "WARNING"
+            Write-BootstrapLog -Message (
+                "Key Vault secret operation failed on attempt {0}: {1}. Retrying." -f
+                $Attempt,
+                $_.Exception.Message
+            ) -Level "WARNING"
+
             Start-Sleep -Seconds $DelaySeconds
         }
     }
 }
-
-function Get-DsrmPasswordWithRetry {
-    [CmdletBinding()]
-    param (
-        [ValidateRange(1, 20)]
-        [int]$MaximumAttempts = 10,
-
-        [ValidateRange(1, 120)]
-        [int]$DelaySeconds = 15
-    )
-
-    $secretName = [Uri]::EscapeDataString($script:DsrmSecretName)
-    $secretUri = "https://$($script:DsrmVaultName).vault.azure.net/secrets/$($secretName)?api-version=7.4"
-
-    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
-        try {
-            Write-BootstrapLog -Message "Key Vault DSRM retrieval attempt $attempt of $MaximumAttempts."
-            $token = Get-ManagedIdentityToken -Resource "https://vault.azure.net"
-            $headers = @{ Authorization = "Bearer $token" }
-            $secret = Invoke-RestMethod -Method GET -Uri $secretUri -Headers $headers -TimeoutSec 30 -ErrorAction Stop
-
-            if ([string]$secret.value -eq "") {
-                throw "Key Vault returned an empty DSRM secret value."
-            }
-
-            return [string]$secret.value
-        }
-        catch {
-            if ($attempt -eq $MaximumAttempts) {
-                throw
-            }
-
-            Write-BootstrapLog -Message "DSRM secret retrieval failed: $($_.Exception.Message)" -Level "WARNING"
-            Start-Sleep -Seconds $DelaySeconds
-        }
-    }
-}
-
-
 function Install-EnrollmentPrerequisites {
     [CmdletBinding()]
     param ()
@@ -425,9 +449,15 @@ try {
         throw "Downloaded Linux enrollment script was not found: $DownloadedEnrollmentScript"
     }
 
+    if (-not (Test-Path -LiteralPath $DownloadedReverseZoneScript -PathType Leaf)) {
+        throw "Downloaded reverse-zone script was not found: $DownloadedReversezoneScript"
+    }
+
     Copy-Item -LiteralPath $DownloadedPostRebootScript -Destination $PostRebootScript -Force -ErrorAction Stop
     Copy-Item -LiteralPath $DownloadedEnrollmentScript -Destination $EnrollmentScript -Force -ErrorAction Stop
-    Write-BootstrapLog -Message "Post-reboot scripts staged under '$ProvisioningRoot'." -Level "SUCCESS"
+    Copy-Item -LiteralPath $DownloadedReverseZoneScript -Destination $ReverseZoneScript -Force -ErrorAction Stop
+
+    Write-BootstrapLog -Message "Post-reboot provisioning scripts staged under '$ProvisioningRoot'." -Level "SUCCESS"
 
     # LinuxComputerEnrollment.ps1 declares #Requires for Az.Accounts and
     # Az.KeyVault. Install them before promotion so the SYSTEM continuation
@@ -447,13 +477,36 @@ try {
     Import-Module ADDSDeployment -ErrorAction Stop
     Write-BootstrapLog -Message "AD-Domain-Services and ADDSDeployment are available." -Level "SUCCESS"
 
-    # Retrieve the DSRM secret only when it is needed. Never log the value.
-    $DsrmPassword = Get-DsrmPasswordWithRetry
-    if ($DsrmPassword -eq "") {
-        throw "DSRM password retrieval returned an empty value."
+    # Generate a new DSRM password locally. Never log the value.
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    }
+    finally {
+        if ($null -ne $rng) {
+            $rng.Dispose()
+        }
+    }
+
+    $DsrmPassword = [Convert]::ToBase64String($bytes)
+    [Array]::Clear($bytes, 0, $bytes.Length)
+    $bytes = $null
+
+    if ([string]::IsNullOrWhiteSpace($DsrmPassword)) {
+        throw "DSRM password generation returned an empty value."
     }
 
     $SecureDsrmPassword = ConvertTo-SecureString -String $DsrmPassword -AsPlainText -Force
+    $DsrmPassword = $null
+
+    # Persist the generated DSRM password before forest promotion.
+    $null = Put-DsrmPasswordWithRetry `
+        -Password $SecureDsrmPassword `
+        -VaultName $DsrmVaultName `
+        -SecretName $DsrmSecretName `
+        -NetbiosName $DomainNetbiosName `
+        -AzureSubscriptionId $SubscriptionId
 
     Write-BootstrapLog -Message "Running new-forest prerequisite validation."
     Test-ADDSForestInstallation `

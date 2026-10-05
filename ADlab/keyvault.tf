@@ -20,27 +20,3 @@ resource "azurerm_key_vault" "domain_join" {
     SecurityControl = "Ignore"
   }
 }
-
-resource "random_password" "dsrm" {
-  length = 32
-
-   upper = true
-   lower = true
-   numeric = true
-   special = true
-
-   override_special = "!#$%&*+-.:=?@_"
-}
-
-resource "azurerm_key_vault_secret" "dsrm" {
-  name   = local.dsrm_secret_name
-  value  = random_password.dsrm.result
-  key_vault_id = azurerm_key_vault.domain_join.id
-
-  content_type = "Active Directory DSRM password"
-
-  tags = {
-    Purpose = "Active-Directory-DSRM"
-  }
-}
-

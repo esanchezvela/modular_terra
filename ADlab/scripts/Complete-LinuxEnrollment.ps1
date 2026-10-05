@@ -8,7 +8,8 @@
 .DESCRIPTION
     Waits for Active Directory Domain Services on the newly promoted domain
     controller to become operational, verifies the local DC, DNS registration,
-    SYSVOL and NETLOGON, runs the staged Linux computer enrollment script, and
+    SYSVOL and NETLOGON, configures the reverse DNS zone and domain controller 
+    PTR record, runs the staged Linux computer enrollment script, and
     removes the startup task only after successful completion.
 
 .NOTES
@@ -29,6 +30,7 @@ $ProgressPreference = "SilentlyContinue"
 $TaskName          = "Complete-Linux-AD-Provisioning"
 $ProvisioningRoot  = "C:\ProgramData\LinuxADProvisioning"
 $EnrollmentScript  = Join-Path -Path $ProvisioningRoot -ChildPath "LinuxComputerEnrollment.ps1"
+$ReverseZoneScript = Join-Path -Path $ProvisioningRoot -ChildPath "CreateReverseZone.ps1"
 $LogFile           = Join-Path -Path $ProvisioningRoot -ChildPath "PostReboot.log"
 $DcDiagLog         = Join-Path -Path $ProvisioningRoot -ChildPath "dcdiag.log"
 $SuccessMarker     = Join-Path -Path $ProvisioningRoot -ChildPath "ADDS-Provisioning-Complete.txt"
@@ -179,6 +181,7 @@ try {
 
     $requiredModules = @(
         "ActiveDirectory",
+        "DnsServer",
         "Az.Accounts",
         "Az.KeyVault"
     )
@@ -202,14 +205,22 @@ try {
         ) -Level "SUCCESS"
     }
 
+    #
+    # Configure reverse DNS before Linux computer enrollment.
+    #
+    if (-not (Test-Path -LiteralPath $ReverseZoneScript -PathType Leaf)) {
+        throw "Reverse-zone script was not found: $ReverseZoneScript"
+    )
+
+    Write-PostRebootLog -Message "Starting reverse DNS zone configuration."
+
+    & $ReverseZoneScript
+
+    Write-PostRebootLog -Message "Reverse DNS zone configuration completed successfully." -Level "SUCCESS"
+
     Write-PostRebootLog -Message "Starting Linux computer enrollment script '$EnrollmentScript'."
 
     & $EnrollmentScript
-    $EnrollmentExitCode = $LASTEXITCODE
-
-    if ($EnrollmentExitCode -ne $null -and $EnrollmentExitCode -ne 0) {
-        throw "Linux enrollment script returned exit code $EnrollmentExitCode."
-    }
 
     Write-PostRebootLog -Message "Linux computer enrollment completed successfully." -Level "SUCCESS"
 

@@ -46,3 +46,22 @@ variable "payg" {
     }
   ]
 }
+
+variable "byos" {
+  type = list(object({
+    pubip                = bool
+    name                 = string
+    publisher            = string
+    offer                = string
+    sku                  = string
+    image_version        = string
+    size                 = string
+    custom_data          = string
+    encrypt              = optional(bool, false)
+    network_acceleration = optional(bool, false)
+    nics                 = optional(string, "1")
+    nvme                 = optional(string, "SCSI")
+  }))
+  default = [
+  ]
+}

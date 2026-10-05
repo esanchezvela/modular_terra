@@ -12,7 +12,7 @@ module "network_ad2022" {
 module "network_ad2025" {
   source         = "../modules/network"
   depends_on     = [module.myrg]
-  name           = "network_ad_2025"
+  name           = "network_ad2025"
   location       = var.location
   resource_group = var.rg_name
   cidr           = "10.200.0.0/16"
@@ -65,3 +65,10 @@ resource "azurerm_virtual_network_peering" "peer20" {
   remote_virtual_network_id = module.network_ad2022.network_id
 }
 
+
+resource "azurerm_virtual_network_dns_servers" "dns_servers" {
+  depends_on = [ module.network, module.controller22]
+
+  virtual_network_id = module.network.network_id
+  dns_servers = [ module.controller22.priv_address ]
+}

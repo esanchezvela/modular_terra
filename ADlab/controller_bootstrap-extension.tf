@@ -1,6 +1,6 @@
 resource "azurerm_virtual_machine_extension" "ad_bootstrap" {
   depends_on  = [ 
-    time_sleep.wait_for_dependencies,
+    time_sleep.controller_wait_for_dependencies,
     module.controller22
   ]
 
@@ -20,7 +20,8 @@ resource "azurerm_virtual_machine_extension" "ad_bootstrap" {
     fileUris = [
       azurerm_storage_blob.bootstrap.url,
       azurerm_storage_blob.post_reboot.url,
-      azurerm_storage_blob.linux_enrollment.url
+      azurerm_storage_blob.linux_enrollment.url,
+      azurerm_storage_blob.reverse_zone.url
     ]
 
     commandToExecute = join(

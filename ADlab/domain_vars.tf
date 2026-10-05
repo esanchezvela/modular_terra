@@ -6,7 +6,7 @@ variable "custom_domain" {
 
 variable "computer_ou" {
   description = "OU to stage the Linux Servers in Domain"
-  default = "OU=LINUXSERVERS,OU=SERVERS,DC=AD22,DC=NEWXYZ,DC=SITE"
+  default = "OU=LINUXSERVERS,DC=AD22,DC=NEWXYZ,DC=SITE"
 }
 
 variable "domain_netbios_name" {

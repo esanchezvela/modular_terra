@@ -22,6 +22,20 @@ locals {
     }
   )
 
+
+  domain_join_script_here = <<-HERE
+    set -euo pipefail
+    /opt/vm-deployment/venv/bin/python /opt/vm-deployment/deploy.py --domain $${custom_domain} \
+              --computer_ou $${computer_ou} \
+              --vault $${vault_name}
+  HERE
+  domain_join_script = templatestring(local.domain_join_script_here, {
+         vault_name = azurerm_key_vault.domain_join.name,
+         computer_ou = var.computer_ou,
+         custom_domain = var.custom_domain 
+     }
+  )
+
   post_reboot_script = file("${path.module}/scripts/Complete-LinuxEnrollment.ps1")
   bootstrap_script = templatefile("${path.module}/scripts/Bootstrap-ADDS.ps1.tftpl",
     {
@@ -29,7 +43,7 @@ locals {
       DOMAIN_NETBIOS_NAME = jsonencode(upper(var.domain_netbios_name))
       SUBSCRIPTION_ID     = jsonencode(data.azurerm_client_config.current.subscription_id)
       DSRM_VAULT_NAME     = jsonencode(azurerm_key_vault.domain_join.name)
-      DSRM_SECRET_NAME    = jsonencode(azurerm_key_vault_secret.dsrm.name)
+      DSRM_SECRET_NAME    = jsonencode(local.dsrm_secret_name)
     }
   )
 
