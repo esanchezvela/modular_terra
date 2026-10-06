@@ -12,10 +12,10 @@ resource "time_sleep" "controller_wait_for_dependencies" {
     azurerm_private_endpoint.pep_kv,
     azurerm_private_dns_zone_virtual_network_link.kv-network_ad2022,
 
-    azurerm_storage_blob.bootstrap.url,
-    azurerm_storage_blob.post_reboot.url,
-    azurerm_storage_blob.linux_enrollment.url,
-    azurerm_storage_blob.reverse_zone.url
+    azurerm_storage_blob.bootstrap,
+    azurerm_storage_blob.post_reboot,
+    azurerm_storage_blob.linux_enrollment,
+    azurerm_storage_blob.reverse_zone
   ]
 
   create_duration = "60s"

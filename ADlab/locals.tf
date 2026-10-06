@@ -24,8 +24,9 @@ locals {
 
 
   domain_join_script_here = <<-HERE
+    #!/bin/bash
     set -euo pipefail
-    /opt/vm-deployment/venv/bin/python /opt/vm-deployment/deploy.py --domain $${custom_domain} \
+    /opt/vm-deployment/restart_network.sh && /opt/vm-deployment/venv/bin/python /opt/vm-deployment/deploy.py --domain $${custom_domain} \
               --computer_ou $${computer_ou} \
               --vault $${vault_name}
   HERE

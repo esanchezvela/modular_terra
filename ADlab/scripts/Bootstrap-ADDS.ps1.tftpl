@@ -354,34 +354,56 @@ function Register-PostRebootTask {
     [CmdletBinding()]
     param ()
 
-    $action = New-ScheduledTaskAction `
-        -Execute "PowerShell.exe" `
-        -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script:PostRebootScript`""
+    $PowerShellPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $CmdPath = "$env:SystemRoot\System32\cmd.exe"
+    $TaskOutputLog = Join-Path -Path $script:ProvisioningRoot -ChildPath "PostReboot-Console.log"
 
-    $trigger = New-ScheduledTaskTrigger -AtStartup
+    # cmd.exe owns stdout/stderr redirection, so parser errors and #Requires
+    # failures from the child script are captured before its own logging starts.
+    $ActionArguments = (
+        '/d /s /c ""{0}" -NoLogo -NoProfile -NonInteractive ' +
+        '-ExecutionPolicy Bypass -File "{1}" 1>>"{2}" 2>&1"'
+    ) -f
+        $PowerShellPath,
+        $script:PostRebootScript,
+        $TaskOutputLog
 
-    $principal = New-ScheduledTaskPrincipal `
+    $Action = New-ScheduledTaskAction `
+        -Execute $CmdPath `
+        -Argument $ActionArguments
+
+    $Trigger = New-ScheduledTaskTrigger -AtStartup
+
+    $Principal = New-ScheduledTaskPrincipal `
         -UserId "SYSTEM" `
         -LogonType ServiceAccount `
         -RunLevel Highest
 
-    $settings = New-ScheduledTaskSettingsSet `
+    $Settings = New-ScheduledTaskSettingsSet `
         -StartWhenAvailable `
         -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+        -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+        -RestartCount 5 `
+        -RestartInterval (New-TimeSpan -Minutes 2)
 
     Register-ScheduledTask `
         -TaskName $script:PostRebootTaskName `
-        -Action $action `
-        -Trigger $trigger `
-        -Principal $principal `
-        -Settings $settings `
+        -Action $Action `
+        -Trigger $Trigger `
+        -Principal $Principal `
+        -Settings $Settings `
         -Force `
         -ErrorAction Stop | Out-Null
 
-    if ((Get-ScheduledTask -TaskName $script:PostRebootTaskName -ErrorAction Stop).TaskName -ne $script:PostRebootTaskName) {
+    $RegisteredTask = Get-ScheduledTask `
+        -TaskName $script:PostRebootTaskName `
+        -ErrorAction Stop
+
+    if ($RegisteredTask.TaskName -ne $script:PostRebootTaskName) {
         throw "Unable to verify scheduled task '$($script:PostRebootTaskName)'."
     }
+
+    Write-BootstrapLog -Message ("Post-reboot task registered. Console output will be captured in '{0}'." -f $TaskOutputLog) -Level "SUCCESS"
 }
 
 function Remove-PostRebootTask {

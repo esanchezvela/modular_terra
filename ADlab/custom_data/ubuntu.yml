@@ -17,6 +17,15 @@ packages:
   - python3-pip
 
 write_files:
+  - path: /opt/vm-deployment/restart_network.sh
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/usr/bin/bash
+      set -euo pipefail
+
+      netplan apply 
+
   - path: /opt/vm-deployment/deploy.py
     owner: root:root
     permissions: "0700"

@@ -13,6 +13,16 @@ packages:
   - nmap
 
 write_files:
+  - path: /opt/vm-deployment/restart_network.sh
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/usr/bin/bash
+      set -euo pipefail
+
+      systemctl restart systemd-networkd
+      sleep 10
+
   - path: /opt/vm-deployment/deploy.py
     owner: root:root
     permissions: "0700"

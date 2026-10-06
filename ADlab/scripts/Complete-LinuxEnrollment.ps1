@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 <#
@@ -6,18 +6,13 @@
     Post-reboot continuation for the ADlab controller22 deployment.
 
 .DESCRIPTION
-    Waits for Active Directory Domain Services on the newly promoted domain
-    controller to become operational, verifies the local DC, DNS registration,
-    SYSVOL and NETLOGON, configures the reverse DNS zone and domain controller 
-    PTR record, runs the staged Linux computer enrollment script, and
-    removes the startup task only after successful completion.
+    Waits for Active Directory Domain Services to become operational, records
+    the exact readiness failure while waiting, runs DCDIAG, configures reverse
+    DNS, runs Linux computer enrollment, and removes the scheduled task only
+    after successful completion.
 
-.NOTES
-    Designed to be staged by Bootstrap-ADDS.ps1 under:
-      C:\ProgramData\LinuxADProvisioning
-
-    Failure intentionally leaves the scheduled task registered so the workflow
-    can retry after a subsequent reboot or manual task start.
+    Console output and parser/startup errors are captured externally by the
+    scheduled-task action in Bootstrap-ADDS.ps1.tftpl.
 #>
 
 [CmdletBinding()]
@@ -27,103 +22,167 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$TaskName          = "Complete-Linux-AD-Provisioning"
-$ProvisioningRoot  = "C:\ProgramData\LinuxADProvisioning"
-$EnrollmentScript  = Join-Path -Path $ProvisioningRoot -ChildPath "LinuxComputerEnrollment.ps1"
-$ReverseZoneScript = Join-Path -Path $ProvisioningRoot -ChildPath "CreateReverseZone.ps1"
-$LogFile           = Join-Path -Path $ProvisioningRoot -ChildPath "PostReboot.log"
-$DcDiagLog         = Join-Path -Path $ProvisioningRoot -ChildPath "dcdiag.log"
-$SuccessMarker     = Join-Path -Path $ProvisioningRoot -ChildPath "ADDS-Provisioning-Complete.txt"
-$FailureMarker     = Join-Path -Path $ProvisioningRoot -ChildPath "ADDS-Provisioning-Failed.txt"
+$TaskName = "Complete-Linux-AD-Provisioning"
+$ProvisioningRoot = "C:\ProgramData\LinuxADProvisioning"
+$EnrollmentScript = "$ProvisioningRoot\LinuxComputerEnrollment.ps1"
+$ReverseZoneScript = "$ProvisioningRoot\CreateReverseZone.ps1"
+$LogFile = "$ProvisioningRoot\PostReboot.log"
+$ConsoleLog = "$ProvisioningRoot\PostReboot-Console.log"
+$ErrorDetailLog = "$ProvisioningRoot\PostReboot-ErrorDetail.log"
+$DcDiagLog = "$ProvisioningRoot\dcdiag.log"
+$SuccessMarker = "$ProvisioningRoot\ADDS-Provisioning-Complete.txt"
+$FailureMarker = "$ProvisioningRoot\ADDS-Provisioning-Failed.txt"
 
-$MaximumWait       = New-TimeSpan -Minutes 30
-$RetryInterval     = New-TimeSpan -Seconds 10
-$Stopwatch         = [Diagnostics.Stopwatch]::StartNew()
+$MaximumWait = New-TimeSpan -Minutes 30
+$RetryInterval = New-TimeSpan -Seconds 10
+$Stopwatch = [Diagnostics.Stopwatch]::StartNew()
 
 function Write-PostRebootLog {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Message,
 
-        [Parameter()]
+        [Parameter(Mandatory = $false)]
         [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS")]
         [string]$Level = "INFO"
     )
 
-    $entry = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    $Entry = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
 
     try {
-        Add-Content -LiteralPath $script:LogFile -Value $entry -Encoding UTF8 -ErrorAction Stop
+        Add-Content -LiteralPath $script:LogFile -Value $Entry -Encoding UTF8 -ErrorAction Stop
     }
     catch {
-        Write-Warning "Unable to write post-reboot log: $($_.Exception.Message)"
+        Write-Warning ("Unable to write post-reboot log '{0}': {1}" -f $script:LogFile, $_.Exception.Message)
     }
 
     switch ($Level) {
-        "WARNING" { Write-Host $entry -ForegroundColor Yellow }
-        "ERROR"   { Write-Host $entry -ForegroundColor Red }
-        "SUCCESS" { Write-Host $entry -ForegroundColor Green }
-        default   { Write-Host $entry }
+        "WARNING" { Write-Host $Entry -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $Entry -ForegroundColor Red }
+        "SUCCESS" { Write-Host $Entry -ForegroundColor Green }
+        default   { Write-Host $Entry }
     }
 }
 
-function Test-ServiceRunning {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name
-    )
-
-    try {
-        $service = Get-Service -Name $Name -ErrorAction Stop
-        return $service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running
-    }
-    catch {
-        return $false
-    }
-}
-
-function Test-ActiveDirectoryReady {
+function Get-ActiveDirectoryReadiness {
     [CmdletBinding()]
     param ()
 
     try {
-        foreach ($serviceName in @("NTDS", "DNS", "Netlogon")) {
-            if (-not (Test-ServiceRunning -Name $serviceName)) {
-                return $false
+        foreach ($ServiceName in @("NTDS", "DNS", "Netlogon")) {
+            $Service = Get-Service -Name $ServiceName -ErrorAction Stop
+
+            if ($Service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Running) {
+                return [pscustomobject]@{
+                    Ready  = $false
+                    Reason = "Service '$ServiceName' is '$($Service.Status)'."
+                }
             }
         }
 
         Import-Module ActiveDirectory -ErrorAction Stop
 
-        $domain = Get-ADDomain -ErrorAction Stop
-        $forest = Get-ADForest -ErrorAction Stop
-        $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
+        $Domain = Get-ADDomain -ErrorAction Stop
+        $Forest = Get-ADForest -ErrorAction Stop
+        $DomainController = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
 
-        if ([string]::IsNullOrWhiteSpace($domain.DNSRoot)) { return $false }
-        if ([string]::IsNullOrWhiteSpace($forest.Name)) { return $false }
-        if ($dc -eq $null) { return $false }
+        if ([string]::IsNullOrWhiteSpace($Domain.DNSRoot)) {
+            return [pscustomobject]@{
+                Ready  = $false
+                Reason = "Get-ADDomain returned an empty DNSRoot."
+            }
+        }
 
-        $srvName = "_ldap._tcp.dc._msdcs.{0}" -f $domain.DNSRoot
-        $srv = @(Resolve-DnsName -Name $srvName -Type SRV -ErrorAction Stop)
-        if ($srv.Count -eq 0) { return $false }
+        if ([string]::IsNullOrWhiteSpace($Forest.Name)) {
+            return [pscustomobject]@{
+                Ready  = $false
+                Reason = "Get-ADForest returned an empty forest name."
+            }
+        }
 
-        $shareNames = @(
+        if ($null -eq $DomainController) {
+            return [pscustomobject]@{
+                Ready  = $false
+                Reason = "The local domain controller could not be resolved."
+            }
+        }
+
+        $SrvName = "_ldap._tcp.dc._msdcs.{0}" -f $Domain.DNSRoot
+        $SrvRecords = @(
+            Resolve-DnsName -Name $SrvName -Type SRV -ErrorAction Stop
+        )
+
+        if ($SrvRecords.Count -eq 0) {
+            return [pscustomobject]@{
+                Ready  = $false
+                Reason = "No SRV records were found for '$SrvName'."
+            }
+        }
+
+        $ShareNames = @(
             Get-SmbShare -ErrorAction Stop |
                 Select-Object -ExpandProperty Name
         )
 
-        if ($shareNames -notcontains "SYSVOL") { return $false }
-        if ($shareNames -notcontains "NETLOGON") { return $false }
+        if ($ShareNames -notcontains "SYSVOL") {
+            return [pscustomobject]@{
+                Ready  = $false
+                Reason = "The SYSVOL share is not available."
+            }
+        }
 
-        return $true
+        if ($ShareNames -notcontains "NETLOGON") {
+            return [pscustomobject]@{
+                Ready  = $false
+                Reason = "The NETLOGON share is not available."
+            }
+        }
+
+        return [pscustomobject]@{
+            Ready  = $true
+            Reason = "All readiness checks passed."
+        }
     }
     catch {
-        return $false
+        return [pscustomobject]@{
+            Ready  = $false
+            Reason = "{0}: {1}" -f $_.Exception.GetType().FullName, $_.Exception.Message
+        }
     }
+}
+
+function Get-ErrorDetailText {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $Exception = $ErrorRecord.Exception
+    $InnerException = "<none>"
+
+    if ($null -ne $Exception.InnerException) {
+        $InnerException = $Exception.InnerException.ToString()
+    }
+
+    return @"
+Timestamp=$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+Computer=$env:COMPUTERNAME
+User=$([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+Message=$($Exception.Message)
+ExceptionType=$($Exception.GetType().FullName)
+FullyQualifiedErrorId=$($ErrorRecord.FullyQualifiedErrorId)
+Category=$($ErrorRecord.CategoryInfo)
+ScriptName=$($ErrorRecord.InvocationInfo.ScriptName)
+Line=$($ErrorRecord.InvocationInfo.ScriptLineNumber)
+Position=$($ErrorRecord.InvocationInfo.PositionMessage)
+Command=$($ErrorRecord.InvocationInfo.MyCommand)
+ScriptStackTrace=$($ErrorRecord.ScriptStackTrace)
+InnerException=$InnerException
+ErrorRecord=$($ErrorRecord.ToString())
+"@
 }
 
 try {
@@ -132,106 +191,114 @@ try {
     }
 
     Remove-Item -LiteralPath $FailureMarker -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $ErrorDetailLog -Force -ErrorAction SilentlyContinue
 
     Write-PostRebootLog -Message "Starting post-reboot provisioning."
     Write-PostRebootLog -Message "Computer: $env:COMPUTERNAME"
+    Write-PostRebootLog -Message ("Execution identity: {0}" -f [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    Write-PostRebootLog -Message "Console capture: $ConsoleLog"
     Write-PostRebootLog -Message "Waiting for AD DS, DNS, Netlogon, AD queries, DNS SRV records, SYSVOL, and NETLOGON."
 
+    $Readiness = $null
+
     while ($Stopwatch.Elapsed -lt $MaximumWait) {
-        if (Test-ActiveDirectoryReady) {
+        $Readiness = Get-ActiveDirectoryReadiness
+
+        if ($Readiness.Ready) {
             Write-PostRebootLog -Message "Active Directory readiness checks passed." -Level "SUCCESS"
             break
         }
 
         Write-PostRebootLog -Message (
-            "Active Directory is not ready yet. Elapsed: {0:n0} seconds." -f $Stopwatch.Elapsed.TotalSeconds
+            "Active Directory is not ready. Elapsed={0:n0}s. Reason={1}" -f
+            $Stopwatch.Elapsed.TotalSeconds,
+            $Readiness.Reason
         ) -Level "WARNING"
 
         Start-Sleep -Seconds ([int]$RetryInterval.TotalSeconds)
     }
 
-    if (-not (Test-ActiveDirectoryReady)) {
-        throw "Active Directory did not become ready within $([int]$MaximumWait.TotalMinutes) minutes."
+    if ($null -eq $Readiness -or -not $Readiness.Ready) {
+        $FinalReason = "No readiness result was returned."
+
+        if ($null -ne $Readiness) {
+            $FinalReason = $Readiness.Reason
+        }
+
+        throw (
+            "Active Directory did not become ready within {0} minutes. Last failure: {1}" -f
+            [int]$MaximumWait.TotalMinutes,
+            $FinalReason
+        )
     }
 
     Import-Module ActiveDirectory -ErrorAction Stop
-    $domain = Get-ADDomain -ErrorAction Stop
-    $forest = Get-ADForest -ErrorAction Stop
-    $dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
+    $Domain = Get-ADDomain -ErrorAction Stop
+    $Forest = Get-ADForest -ErrorAction Stop
+    $DomainController = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop
 
-    Write-PostRebootLog -Message "Domain verified: $($domain.DNSRoot)" -Level "SUCCESS"
-    Write-PostRebootLog -Message "Forest verified: $($forest.Name)" -Level "SUCCESS"
-    Write-PostRebootLog -Message "Domain controller verified: $($dc.HostName)" -Level "SUCCESS"
+    Write-PostRebootLog -Message "Domain verified: $($Domain.DNSRoot)" -Level "SUCCESS"
+    Write-PostRebootLog -Message "Forest verified: $($Forest.Name)" -Level "SUCCESS"
+    Write-PostRebootLog -Message "Domain controller verified: $($DomainController.HostName)" -Level "SUCCESS"
 
     Write-PostRebootLog -Message "Running DCDIAG connectivity, advertising, services, and DNS checks."
 
-    $dcDiagOutput = & dcdiag.exe /test:Connectivity /test:Advertising /test:Services /test:DNS 2>&1
-    $dcDiagExitCode = $LASTEXITCODE
-    $dcDiagOutput | Out-File -LiteralPath $DcDiagLog -Encoding UTF8 -Force
+    $DcDiagOutput = & dcdiag.exe /test:Connectivity /test:Advertising /test:Services /test:DNS 2>&1
+    $DcDiagExitCode = $LASTEXITCODE
+    $DcDiagOutput | Out-File -LiteralPath $DcDiagLog -Encoding UTF8 -Force
 
-    if ($dcDiagExitCode -ne 0) {
-        throw "DCDIAG returned exit code $dcDiagExitCode. Review '$DcDiagLog'."
+    if ($DcDiagExitCode -ne 0) {
+        throw "DCDIAG returned exit code $DcDiagExitCode. Review '$DcDiagLog'."
     }
 
     Write-PostRebootLog -Message "DCDIAG completed successfully." -Level "SUCCESS"
 
-    if (-not (Test-Path -LiteralPath $EnrollmentScript -PathType Leaf)) {
-        throw "Linux enrollment script was not found at '$EnrollmentScript'."
+    foreach ($RequiredFile in @($ReverseZoneScript, $EnrollmentScript)) {
+        if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
+            throw "Required provisioning script was not found: $RequiredFile"
+        }
     }
 
-    $requiredModules = @(
+    $RequiredModules = @(
         "ActiveDirectory",
         "DnsServer",
         "Az.Accounts",
         "Az.KeyVault"
     )
 
-    foreach ($moduleName in $requiredModules) {
-        $module = Get-Module `
-            -Name $moduleName `
-            -ListAvailable `
-            -ErrorAction SilentlyContinue |
+    foreach ($ModuleName in $RequiredModules) {
+        $Module = Get-Module -Name $ModuleName -ListAvailable -ErrorAction SilentlyContinue |
             Sort-Object -Property Version -Descending |
             Select-Object -First 1
 
-        if ($null -eq $module) {
-            throw "Required PowerShell module '$moduleName' is not available."
+        if ($null -eq $Module) {
+            throw "Required PowerShell module '$ModuleName' is not available."
         }
 
         Write-PostRebootLog -Message (
             "Required PowerShell module '{0}' version {1} verified." -f
-            $moduleName,
-            $module.Version
+            $ModuleName,
+            $Module.Version
         ) -Level "SUCCESS"
     }
 
-    #
-    # Configure reverse DNS before Linux computer enrollment.
-    #
-    if (-not (Test-Path -LiteralPath $ReverseZoneScript -PathType Leaf)) {
-        throw "Reverse-zone script was not found: $ReverseZoneScript"
-    )
-
     Write-PostRebootLog -Message "Starting reverse DNS zone configuration."
-
     & $ReverseZoneScript
-
     Write-PostRebootLog -Message "Reverse DNS zone configuration completed successfully." -Level "SUCCESS"
 
     Write-PostRebootLog -Message "Starting Linux computer enrollment script '$EnrollmentScript'."
-
     & $EnrollmentScript
-
     Write-PostRebootLog -Message "Linux computer enrollment completed successfully." -Level "SUCCESS"
 
     @"
 AD DS post-reboot provisioning completed successfully.
 Computer=$env:COMPUTERNAME
-Domain=$($domain.DNSRoot)
-Forest=$($forest.Name)
-DomainController=$($dc.HostName)
+Domain=$($Domain.DNSRoot)
+Forest=$($Forest.Name)
+DomainController=$($DomainController.HostName)
 Completed=$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-DCDIAGExitCode=$dcDiagExitCode
+DCDIAGExitCode=$DcDiagExitCode
+ConsoleLog=$ConsoleLog
 "@ | Set-Content -LiteralPath $SuccessMarker -Encoding UTF8 -Force
 
     Write-PostRebootLog -Message "Success marker written to '$SuccessMarker'." -Level "SUCCESS"
@@ -242,27 +309,42 @@ DCDIAGExitCode=$dcDiagExitCode
     exit 0
 }
 catch {
-    $errorMessage = $_.Exception.Message
+    $ErrorRecord = $_
+    $ErrorMessage = $ErrorRecord.Exception.Message
+    $ErrorDetails = Get-ErrorDetailText -ErrorRecord $ErrorRecord
 
-    Write-PostRebootLog -Message "Post-reboot provisioning failed: $errorMessage" -Level "ERROR"
+    try {
+        $ErrorDetails | Out-File -LiteralPath $ErrorDetailLog -Encoding UTF8 -Force
+    }
+    catch {
+        Write-Warning ("Unable to write detailed error log '{0}': {1}" -f $ErrorDetailLog, $_.Exception.Message)
+    }
+
+    Write-PostRebootLog -Message "Post-reboot provisioning failed: $ErrorMessage" -Level "ERROR"
+    Write-PostRebootLog -Message "Detailed error record: $ErrorDetailLog" -Level "ERROR"
 
     @"
 AD DS post-reboot provisioning failed.
 Computer=$env:COMPUTERNAME
 Time=$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-Error=$errorMessage
+Error=$ErrorMessage
+ExceptionType=$($ErrorRecord.Exception.GetType().FullName)
+Line=$($ErrorRecord.InvocationInfo.ScriptLineNumber)
+Command=$($ErrorRecord.InvocationInfo.MyCommand)
 
 Review:
 $LogFile
+$ConsoleLog
+$ErrorDetailLog
 $DcDiagLog
 C:\Windows\debug\dcpromo.log
 C:\Windows\debug\dcpromoui.log
 "@ | Set-Content -LiteralPath $FailureMarker -Encoding UTF8 -Force
 
-    # Intentionally retain the scheduled task on failure so the workflow can
-    # retry on a later boot or when the task is started manually.
     exit 1
 }
 finally {
-    $Stopwatch.Stop()
+    if ($null -ne $Stopwatch) {
+        $Stopwatch.Stop()
+    }
 }

@@ -44,8 +44,13 @@ resource "azurerm_storage_blob" "linux_enrollment" {
 }
 
 resource "azurerm_storage_blob" "reverse_zone" {
-  name                   = "CreateReversezone.ps1"
-  storage_account_name   = azurerm_storage_account.provisioning.name
+  depends_on = [
+    azurerm_private_endpoint.pep_blob,
+    azurerm_storage_container.provisioning,
+    azurerm_private_dns_zone_virtual_network_link.blob-network_ad2022
+  ]
+  name                   = "CreateReverseZone.ps1"
+  storage_container_id   = azurerm_storage_container.provisioning.id
   type                   = "Block"
 
   source = "${path.module}/scripts/CreateReverseZone.ps1"
