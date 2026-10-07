@@ -1,65 +1,353 @@
-## Automated Hybrid Identity Lab (Azure ADLab)
-A fully automated Active Directory (AD) infrastructure deployed on Microsoft Azure using Infrastructure as Code (IaC). This lab provisions an isolated network environment featuring a Windows Domain Controller and 7 Linux client machines seamlessly enrolled into the AD domain upon creation.
-The entire architecture is designed with a Zero-Trust perspective, utilizing Private Endpoints, strict Azure RBAC, and secure Key Vault secret management so that sensitive domain credentials and backend orchestration never expose themselves to the public internet.
-------------------------------
-## 🏗️ Architecture Overview
-The lab deploys a modular, secure network topology in Azure that consists of:
+# Active Directory Linux Lab on Azure
 
-* Identity & Domain Services: A Windows Server VM provisioned and bootstrapped automatically as an Active Directory Domain Controller (controller_bootstrap-extension.tf).
-* Linux Client Fleet: 7 Linux Virtual Machines automatically enrolled into the Active Directory domain during provisioning (linux_commands-extension.tf).
-* Zero-Trust Networking:
-* Private Endpoints: Isolated connectivity for Azure Key Vault and Azure Blob Storage (keyvault_private_connection.tf, blob-private-connection.tf), ensuring secrets and bootstrap scripts move strictly across the Microsoft backbone network.
-   * Secure Egress: A NAT Gateway handles managed outbound internet connectivity for updates without opening unmanaged inbound vectors (nat-gw.tf).
-   * Micro-segmentation: Granular Network Security Groups (NSGs) locking down traffic between the clients and the Domain Controller (nsg.tf).
-* Security & Secret Management:
-* Azure Key Vault: Centralized management of domain admin passwords and enrollment tokens (keyvault.tf).
-   * Azure RBAC: Strict Identity and Access Management applied to both Windows and Linux infrastructures (windows-rbac.tf, linux-rbac.tf).
+> [!WARNING]
+> **LAB USE ONLY - NOT PRODUCTION READY**
+>
+> This repository is a **lab exercise** intended for learning, testing, and experimentation.
+> It is **not designed or validated for production use** and should not be considered a production reference architecture.
 
-------------------------------
-## 🛠️ Tech Stack & Tooling
+## Overview
 
-* Infrastructure as Code (IaC): Terraform (utilizing modular local references, explicit time delays for sequential bootstrapping, and structured variables.auto.tfvars.json).
-* Configuration Management & Bootstrapping: PowerShell (for Windows Active Directory Domain services deployment) and Python / Bash scripts (for automated Linux realm/SSSD orchestration).
-* Cloud Provider: Microsoft Azure (Compute, Networking, Storage, Security).
+This project uses **Terraform** and automated provisioning to deploy an **Active Directory lab environment in Microsoft Azure**.
 
-------------------------------
-## 📁 Repository Structure
-------------------------------
-## 🚀 Deployment## Prerequisites
+The lab includes a Windows Server Active Directory Domain Controller and **8 Linux Active Directory client VMs** running:
 
-   1. [Terraform CLI](https://developer.hashicorp.com/terraform/downloads) installed.
-   2. [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) installed and authenticated (az login).
-   3. An active Azure Subscription with permissions to create Resource Groups, Key Vaults, and Virtual Machines.
+- 🟠 **Ubuntu**
+- 🔵 **AlmaLinux**
+- 🔴 **Red Hat Enterprise Linux (RHEL)**
+- 🟦 **Azure Linux 4**
 
-## Step-by-Step Execution
+The Linux VMs are automatically configured and enrolled into the Active Directory domain as part of the deployment.
 
-   1. Clone the Repository:
-   
-   git clone https://github.com
-   cd modular_terra/ADlab
-   
-   2. Configure Variables:
-   Modify variables.auto.tfvars.json or customize variables.tf to match your desired naming conventions, domain paths (e.g., corp.local), and regional deployment settings.
-   3. Initialize Terraform:
-   
-   terraform init
-   
-   4. Review the Plan:
-   Inspect the execution path to verify all 7 Linux clients, private endpoints, and extensions are mapped correctly.
-   
-   terraform plan
-   
-   5. Deploy the Infrastructure:
-   
-   terraform apply --auto-approve
-   
-   Note: Due to built-in dependencies (time_delay.tf), the Linux extensions will intentionally wait for the Active Directory Domain Controller VM extension to finish provisioning its forest before attempting domain enrollment.
+The purpose of this project is to provide a repeatable environment for experimenting with **Linux integration with Active Directory**, infrastructure automation, and Azure networking.
 
-------------------------------
-## 🔒 Deep Dive: Enterprise Design Patterns Implemented
-## 1. Sequential Automation via VM Extensions
-Rather than requiring manual post-deployment tasks, this lab relies heavily on Azure Custom Script Extensions. The Windows Domain Controller uses PowerShell to spin up AD, configure DNS, and establish the domain forest. Once complete, the Linux nodes execute automated Python/Bash routines to download domain details, configure SSSD (systemd), and bind seamlessly.
-## 2. Private Link Isolation
-To mimic real-world secure landing zones, the Azure Storage Account holding provisioning scripts and the Azure Key Vault holding domain passwords have public network access entirely disabled. All communication is routed privately through dedicated network interface cards (NICs) inside your VNet.
-## 3. Graceful Race-Condition Prevention
-Active Directory takes time to configure. To prevent the 7 Linux clients from attempting to join a domain controller that isn't fully operational yet, the Terraform configuration leverages explicit dependency tracking and time-delay resources to pause execution until the identity provider is healthy.
+---
+
+## 🧪 Lab at a Glance
+
+| Component | Description |
+|---|---|
+| Active Directory | Windows Server Domain Controller |
+| Linux Clients | **8 VMs** |
+| Linux Distributions | Ubuntu, AlmaLinux, RHEL, Azure Linux 4 |
+| Infrastructure | Microsoft Azure |
+| Deployment | Terraform |
+| Linux AD Integration | SSSD |
+| Automation | PowerShell, Python, Bash |
+| Secrets | Azure Key Vault |
+| Connectivity | Azure networking and Private Endpoints |
+
+---
+
+## 🏗️ Architecture
+
+```text
+                         Microsoft Azure
+                                │
+                       ┌────────┴────────┐
+                       │                 │
+                Windows Server      Azure Services
+                Domain Controller        │
+                       │          ┌──────┴──────┐
+                       │          │             │
+                       │      Key Vault      Storage
+                       │
+             ┌─────────┴─────────┐
+             │                   │
+      Active Directory      Linux Clients
+                             8 VMs Total
+                                  │
+                   ┌──────────────┼──────────────┐
+                   │              │              │
+                Ubuntu        AlmaLinux         RHEL
+                                                  │
+                                           Azure Linux 4
+```
+
+The environment is designed to provide a controlled sandbox for exploring Active Directory integration across multiple Linux distributions.
+
+---
+
+## 💻 Linux Active Directory Clients
+
+The lab deploys **8 Linux virtual machines** across four distributions:
+
+### Ubuntu
+
+Ubuntu-based virtual machines configured as Active Directory clients.
+
+### AlmaLinux
+
+AlmaLinux virtual machines used to test Active Directory integration in an Enterprise Linux-compatible environment.
+
+### Red Hat Enterprise Linux
+
+RHEL virtual machines configured for Active Directory integration.
+
+### Azure Linux 4
+
+Azure Linux 4 virtual machines used to explore Active Directory integration on Microsoft's Linux distribution.
+
+Together, these systems provide a multi-distribution environment for experimenting with Linux authentication and identity integration.
+
+---
+
+## 🪟 Active Directory Domain Controller
+
+A Windows Server VM is provisioned as the lab's **Active Directory Domain Controller**.
+
+The automated deployment configures the infrastructure required by the Linux clients for domain integration.
+
+The overall workflow is:
+
+```text
+Deploy Infrastructure
+        │
+        ▼
+Configure Domain Controller
+        │
+        ▼
+Initialize Active Directory
+        │
+        ▼
+Deploy Linux Clients
+        │
+        ▼
+Configure Linux AD Integration
+        │
+        ▼
+Join Linux Clients to the Domain
+```
+
+---
+
+## ☁️ Azure Infrastructure
+
+The lab brings together several Azure infrastructure components.
+
+### Networking
+
+- Azure Virtual Network
+- Subnets
+- Network Security Groups
+- NAT Gateway
+- Private Endpoints
+
+### Identity and Secrets
+
+- Azure Key Vault
+- Azure RBAC
+- Managed identities
+
+### Provisioning and Automation
+
+- Terraform
+- Azure VM Extensions
+- PowerShell
+- Python
+- Bash
+
+---
+
+## 🛠️ Technology Stack
+
+| Technology | Role in the Lab |
+|---|---|
+| Terraform | Infrastructure deployment |
+| Active Directory Domain Services | Windows identity services |
+| SSSD | Linux AD integration |
+| PowerShell | Windows and AD automation |
+| Python | Provisioning automation |
+| Bash | Linux configuration |
+| Azure Key Vault | Secret management |
+| Azure Blob Storage | Deployment resources |
+| Azure Private Link | Private connectivity |
+| Azure RBAC | Azure authorization |
+| Azure VM Extensions | VM bootstrap and configuration |
+
+---
+
+## 🎯 Lab Goals
+
+This project provides a sandbox for experimenting with:
+
+- Infrastructure as Code using Terraform
+- Automated Active Directory deployment
+- Linux integration with Active Directory
+- SSSD-based identity integration
+- Multi-distribution Linux domain enrollment
+- Windows and Linux provisioning automation
+- Azure Key Vault integration
+- Azure RBAC
+- Azure Private Endpoints
+- Azure networking
+- VM bootstrap automation
+- Resource dependencies and deployment sequencing
+
+The focus is **learning, testing, troubleshooting, and experimentation**, rather than production architecture.
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+Before deploying the lab, ensure you have:
+
+1. [Terraform CLI](https://developer.hashicorp.com/terraform/downloads)
+2. https://learn.microsoft.com/cli/azure/install-azure-cli
+3. An Azure subscription with permissions to deploy the required resources
+
+Authenticate to Azure:
+
+```bash
+az login
+```
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/esanchezvela/modular_terra.git
+cd modular_terra/ADlab
+```
+
+### Configure the Lab
+
+Review and modify:
+
+```text
+variables.auto.tfvars.json
+```
+
+Set the appropriate values for your lab environment before deployment.
+
+### Initialize Terraform
+
+```bash
+terraform init
+```
+
+### Review the Terraform Plan
+
+```bash
+terraform plan
+```
+
+Review the proposed resources and configuration before proceeding.
+
+### Deploy the Lab
+
+```bash
+terraform apply --auto-approve
+```
+
+---
+
+## 🔍 Implementation Highlights
+
+### Automated AD Provisioning
+
+The lab uses automation to provision the Windows Server infrastructure required for Active Directory.
+
+### Automated Linux Domain Integration
+
+The Linux systems are configured for Active Directory integration as part of the lab deployment.
+
+The same overall concept can therefore be explored across:
+
+```text
+Ubuntu | AlmaLinux | RHEL | Azure Linux 4
+```
+
+### Azure Private Connectivity
+
+The environment incorporates private connectivity for Azure services used by the lab.
+
+### Deployment Dependencies
+
+The environment contains dependencies between infrastructure provisioning, Active Directory initialization, and Linux client configuration.
+
+This makes the project useful for exploring how dependent infrastructure can be coordinated through Terraform and automated provisioning.
+
+---
+
+## 📂 Repository Structure
+
+The Terraform configuration contains components for areas such as:
+
+```text
+ADlab/
+│
+├── Active Directory Domain Controller
+├── Linux VM provisioning
+├── Linux domain integration
+│
+├── Networking
+│   ├── Virtual Network
+│   ├── Network Security Groups
+│   ├── NAT Gateway
+│   └── Private Endpoints
+│
+├── Azure Key Vault
+├── Azure Storage
+├── Azure RBAC
+├── VM Extensions
+└── Deployment dependencies
+```
+
+---
+
+## ⚠️ Production Readiness
+
+> [!CAUTION]
+> ## This project is NOT production ready.
+
+This repository was created as a **technical lab and learning exercise**.
+
+It is intended to make it easy to deploy an environment, experiment with Active Directory and Linux integration, troubleshoot problems, modify configurations, and tear everything down when finished.
+
+Before adapting any part of this project for production, independently evaluate areas such as:
+
+- Security architecture
+- Identity and access controls
+- Credential and secret lifecycle
+- Network security
+- High availability
+- Backup and recovery
+- Disaster recovery
+- Monitoring and alerting
+- Logging and auditing
+- Patch management
+- Configuration management
+- Terraform state management
+- Operational processes
+
+Configuration choices in this repository should **not be interpreted as production recommendations or official Microsoft deployment guidance**.
+
+---
+
+## 🧑‍🔬 Intended Use
+
+This repository is meant to be a **sandbox**.
+
+Use it to:
+
+- 🔬 Experiment
+- 📚 Learn
+- 🧪 Test
+- 🔧 Troubleshoot
+- 💥 Break things
+- 🛠️ Fix them
+- 🔁 Repeat
+
+**If something breaks, that's part of the lab.**
+
+---
+
+## 📜 Disclaimer
+
+This project is provided for **educational, testing, and demonstration purposes only**.
+
+It is **not intended for production environments** and does not represent a complete production architecture.
+
+**Use at your own risk.**
