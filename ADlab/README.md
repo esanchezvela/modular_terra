@@ -16,6 +16,11 @@ The lab includes a Windows Server Active Directory Domain Controller and **8 Lin
 - 🔵 **AlmaLinux**
 - 🔴 **Red Hat Enterprise Linux (RHEL)**
 - 🟦 **Azure Linux 4**
+- 🟢 **SUSE Linux Enterprise Server (SLES 15)**
+- 🟢 **SUSE Linux Enterprise Server 16 (SLES 16)** - *Planned*
+ 
+> [!NOTE]
+> **SLES 16 is planned work and is not currently part of the deployed lab environment.**
 
 The Linux VMs are automatically configured and enrolled into the Active Directory domain as part of the deployment.
 
@@ -29,7 +34,7 @@ The purpose of this project is to provide a repeatable environment for experimen
 |---|---|
 | Active Directory | Windows Server Domain Controller |
 | Linux Clients | **8 VMs** |
-| Linux Distributions | Ubuntu, AlmaLinux, RHEL, Azure Linux 4 |
+| Linux Distributions | Ubuntu, AlmaLinux, RHEL, Azure Linux 4, SLES15 |
 | Infrastructure | Microsoft Azure |
 | Deployment | Terraform |
 | Linux AD Integration | SSSD |
@@ -44,24 +49,26 @@ The purpose of this project is to provide a repeatable environment for experimen
 ```text
                          Microsoft Azure
                                 │
-                       ┌────────┴────────┐
-                       │                 │
-                Windows Server      Azure Services
-                Domain Controller        │
-                       │          ┌──────┴──────┐
-                       │          │             │
-                       │      Key Vault      Storage
-                       │
-             ┌─────────┴─────────┐
-             │                   │
-      Active Directory      Linux Clients
-                             8 VMs Total
-                                  │
-                   ┌──────────────┼──────────────┐
-                   │              │              │
-                Ubuntu        AlmaLinux         RHEL
-                                                  │
-                                           Azure Linux 4
+                  ┌─────────────┴─────────────┐
+                  │                           │
+           Windows Server               Azure Services
+           Domain Controller                  │
+                  │                    ┌───────┴───────┐
+                  │                    │               │
+                  │                Key Vault        Storage
+                  │
+                  │
+          Active Directory Domain
+                  │
+     ┌────────────┼────────────┬────────────┬────────────┐
+     │            │            │            │            │
+     ▼            ▼            ▼            ▼            ▼
+  Ubuntu      AlmaLinux       RHEL     Azure Linux 4    SLES
+     │            │            │            │            │
+     └────────────┴────────────┴────────────┴────────────┘
+                          │
+                 Linux AD Clients
+
 ```
 
 The environment is designed to provide a controlled sandbox for exploring Active Directory integration across multiple Linux distributions.
@@ -72,22 +79,25 @@ The environment is designed to provide a controlled sandbox for exploring Active
 
 The lab deploys **8 Linux virtual machines** across four distributions:
 
-### Ubuntu
+### 🟠 Ubuntu
 
 Ubuntu-based virtual machines configured as Active Directory clients.
 
-### AlmaLinux
+### 🔵 AlmaLinux
 
 AlmaLinux virtual machines used to test Active Directory integration in an Enterprise Linux-compatible environment.
 
-### Red Hat Enterprise Linux
+### 🔴 Red Hat Enterprise Linux
 
 RHEL virtual machines configured for Active Directory integration.
 
-### Azure Linux 4
+### 🟦 Azure Linux 4
 
 Azure Linux 4 virtual machines used to explore Active Directory integration on Microsoft's Linux distribution.
 
+### 🟢 SUSE Linux Enterprise Server (SLES 15)
+ 
+SUSE Linux Enterprise Server virtual machines configured as Active Directory clients.
 Together, these systems provide a multi-distribution environment for experimenting with Linux authentication and identity integration.
 
 ---
@@ -256,7 +266,7 @@ The Linux systems are configured for Active Directory integration as part of the
 The same overall concept can therefore be explored across:
 
 ```text
-Ubuntu | AlmaLinux | RHEL | Azure Linux 4
+Ubuntu | AlmaLinux | RHEL | Azure Linux 4 | SLES
 ```
 
 ### Azure Private Connectivity
